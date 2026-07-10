@@ -86,6 +86,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let stdin_rx = spawn_stdin_reader();
 
     let mut stdout = io::stdout();
+    // Match stock mosh-client Display::open/close: run the session on the local
+    // alternate screen, restore primary buffer (and cursor/mouse modes) on exit.
+    // Set MOSH_NO_TERM_INIT=1 to skip (same env as upstream mosh).
+    let _display = DisplaySession::enter(&mut stdout)?;
     let mut last_resize_check = Instant::now();
     let mut cur_cols = cols;
     let mut cur_rows = rows;
@@ -140,6 +144,46 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Stock mosh `Display::open()`: enter alternate screen + application cursor keys.
+/// Uses xterm-compatible CSI (no terminfo). Equivalent to smcup + `\e[?1h`.
+const DISPLAY_OPEN: &[u8] = b"\x1b[?1049h\x1b[?1h";
+
+/// Stock mosh `Display::close()`: leave app-cursor / reset SGR / show cursor /
+/// disable common mouse modes / leave alternate screen (rmcup).
+const DISPLAY_CLOSE: &[u8] = b"\x1b[?1l\x1b[0m\x1b[?25h\
+\x1b[?1003l\x1b[?1002l\x1b[?1001l\x1b[?1000l\
+\x1b[?1015l\x1b[?1006l\x1b[?1005l\
+\x1b[?1049l";
+
+/// RAII guard so rmcup always runs on session end (clean exit, EOF, panic drop).
+struct DisplaySession {
+    active: bool,
+}
+
+impl DisplaySession {
+    fn enter(stdout: &mut impl Write) -> io::Result<Self> {
+        if env::var_os("MOSH_NO_TERM_INIT").is_some() {
+            return Ok(Self { active: false });
+        }
+        stdout.write_all(DISPLAY_OPEN)?;
+        stdout.flush()?;
+        Ok(Self { active: true })
+    }
+}
+
+impl Drop for DisplaySession {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        // Best-effort restore; do not panic in Drop.
+        let mut out = io::stdout();
+        let _ = out.write_all(DISPLAY_CLOSE);
+        let _ = out.flush();
+        self.active = false;
+    }
 }
 
 /// Background stdin reader. Sends `Some(bytes)` on data, `None` on EOF.

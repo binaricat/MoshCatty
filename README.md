@@ -128,6 +128,22 @@ mosh-client 192.0.2.10 60001
 | (Unix) live winsize | Polled via `TIOCGWINSZ` |
 | (Windows) console size | Polled via `GetConsoleScreenBufferInfo` |
 
+### Local alternate screen (stock mosh parity)
+
+Like stock `mosh-client`, the session runs on the **local alternate screen**:
+
+- start: `\e[?1049h\e[?1h` (smcup + application cursor keys)
+- exit: reset cursor/mouse modes + `\e[?1049l` (rmcup)
+
+That keeps HostBytes paint off the primary buffer and restores the pre-mosh
+screen when the client exits. Set `MOSH_NO_TERM_INIT=1` to skip (same env as
+upstream mosh).
+
+**Note:** remote apps (vim/htop) still rely on *mosh-server*'s framebuffer.
+Stock mosh-server does not implement DEC 1049 dual buffers, so residual cells
+after quitting a full-screen remote app can still appear — that is an upstream
+server limitation, not fixed solely by client smcup/rmcup.
+
 ### Windows / ConPTY (Netcatty, node-pty)
 
 Under ConPTY, Ctrl+C raises a Windows `CTRL_C_EVENT` in addition to the `\x03`
@@ -213,7 +229,7 @@ Tests include RFC 7253 empty-AAD vectors, mosh-go interop vectors, fragment OOO 
 CI builds multi-platform `mosh-client` archives and publishes GitHub Releases with tags:
 
 ```text
-moshcatty-0.1.2
+moshcatty-0.1.3
 ```
 
 [Netcatty](https://github.com/binaricat/Netcatty) pulls those assets the same way it previously used `Netcatty-mosh-bin`:
@@ -221,7 +237,7 @@ moshcatty-0.1.2
 ```text
 MOSH_BIN_OWNER=binaricat
 MOSH_BIN_REPO=MoshCatty
-MOSH_BIN_RELEASE=moshcatty-0.1.2   # or resolve latest moshcatty-*
+MOSH_BIN_RELEASE=moshcatty-0.1.3   # or resolve latest moshcatty-*
 npm run fetch:mosh
 ```
 

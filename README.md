@@ -128,6 +128,14 @@ mosh-client 192.0.2.10 60001
 | (Unix) live winsize | Polled via `TIOCGWINSZ` |
 | (Windows) console size | Polled via `GetConsoleScreenBufferInfo` |
 
+### Windows / ConPTY (Netcatty, node-pty)
+
+Under ConPTY, Ctrl+C raises a Windows `CTRL_C_EVENT` in addition to the `\x03`
+byte on stdin. MoshCatty installs a console control handler that **ignores**
+`CTRL_C` / `CTRL_BREAK` as process-kill signals, and clears cooked console input
+flags analogous to Unix `cfmakeraw` (ISIG off). Result: Ctrl+C interrupts the
+*remote* shell instead of exiting the client with `STATUS_CONTROL_C_EXIT`.
+
 ---
 
 ## Architecture

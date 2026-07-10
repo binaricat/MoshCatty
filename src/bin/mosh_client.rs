@@ -5,9 +5,12 @@
 //! ```
 //!
 //! Cross-platform I/O:
-//! - Unix: raw + non-blocking stdin (node-pty compatible)
+//! - Unix: raw + non-blocking stdin (node-pty compatible; cfmakeraw disables ISIG
+//!   so Ctrl+C is a byte, not SIGINT that would kill the client)
 //! - Windows: dedicated stdin thread so UDP poll/keepalive never block
-//!   (fixes ConPTY/node-pty stall — multi-agent audit CRITICAL)
+//!   (fixes ConPTY/node-pty stall — multi-agent audit CRITICAL);
+//!   also installs a console ctrl handler so ConPTY Ctrl+C is not
+//!   STATUS_CONTROL_C_EXIT (Netcatty / node-pty path)
 
 use std::env;
 use std::io::{self, Read, Write};
@@ -319,7 +322,67 @@ fn enter_raw_mode_if_tty() -> Option<RawMode> {
     }
 }
 
-#[cfg(not(unix))]
+/// Windows console "raw-ish" mode: clear ENABLE_PROCESSED_INPUT so Ctrl+C is
+/// not treated solely as a process-control event. ConPTY/node-pty still often
+/// synthesizes CTRL_C_EVENT; `install_signal_flag` ignores that. Restore on drop.
+#[cfg(windows)]
+struct WindowsConsoleMode {
+    handle: *mut std::ffi::c_void,
+    original: u32,
+}
+
+#[cfg(windows)]
+impl WindowsConsoleMode {
+    fn enter() -> Option<Self> {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetStdHandle(n_std_handle: u32) -> *mut std::ffi::c_void;
+            fn GetConsoleMode(handle: *mut std::ffi::c_void, mode: *mut u32) -> i32;
+            fn SetConsoleMode(handle: *mut std::ffi::c_void, mode: u32) -> i32;
+        }
+        const STD_INPUT_HANDLE: u32 = 0xFFFFFFF6; // (u32)-10
+        const ENABLE_PROCESSED_INPUT: u32 = 0x0001;
+        const ENABLE_LINE_INPUT: u32 = 0x0002;
+        const ENABLE_ECHO_INPUT: u32 = 0x0004;
+        unsafe {
+            let handle = GetStdHandle(STD_INPUT_HANDLE);
+            if handle.is_null() || handle == (-1isize as *mut _) {
+                return None;
+            }
+            let mut original = 0u32;
+            if GetConsoleMode(handle, &mut original) == 0 {
+                return None;
+            }
+            // Drop cooked-console bits analogous to cfmakeraw / ISIG off.
+            let raw = original
+                & !(ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+            if SetConsoleMode(handle, raw) == 0 {
+                return None;
+            }
+            Some(Self { handle, original })
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsConsoleMode {
+    fn drop(&mut self) {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetConsoleMode(handle: *mut std::ffi::c_void, mode: u32) -> i32;
+        }
+        unsafe {
+            let _ = SetConsoleMode(self.handle, self.original);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn enter_raw_mode_if_tty() -> Option<WindowsConsoleMode> {
+    WindowsConsoleMode::enter()
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn enter_raw_mode_if_tty() -> Option<()> {
     None
 }
@@ -341,7 +404,54 @@ fn install_signal_flag(running: Arc<AtomicBool>) {
     }
 }
 
-#[cfg(not(unix))]
+/// Ignore CTRL+C / CTRL+BREAK as process-kill under ConPTY (Netcatty/node-pty).
+/// The `\x03` byte is still delivered on stdin and forwarded to mosh-server so
+/// the *remote* foreground process is interrupted — matching Unix mosh-client
+/// after `cfmakeraw` (ISIG off).
+///
+/// Close / logoff / shutdown still request a clean client exit via `running`.
+#[cfg(windows)]
+fn install_signal_flag(running: Arc<AtomicBool>) {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    let _ = FLAG.set(running);
+
+    unsafe extern "system" fn handler(ctrl_type: u32) -> i32 {
+        const CTRL_C_EVENT: u32 = 0;
+        const CTRL_BREAK_EVENT: u32 = 1;
+        const CTRL_CLOSE_EVENT: u32 = 2;
+        const CTRL_LOGOFF_EVENT: u32 = 5;
+        const CTRL_SHUTDOWN_EVENT: u32 = 6;
+        match ctrl_type {
+            CTRL_C_EVENT | CTRL_BREAK_EVENT => {
+                // Handled: do not terminate. Stdin reader still sees \x03.
+                1
+            }
+            CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => {
+                if let Some(flag) = FLAG.get() {
+                    flag.store(false, Ordering::SeqCst);
+                }
+                1
+            }
+            _ => 0,
+        }
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetConsoleCtrlHandler(
+            handler_routine: Option<unsafe extern "system" fn(u32) -> i32>,
+            add: i32,
+        ) -> i32;
+    }
+
+    // Idempotent enough for a single-process CLI; re-register is harmless.
+    unsafe {
+        SetConsoleCtrlHandler(Some(handler), 1);
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn install_signal_flag(running: Arc<AtomicBool>) {
     std::mem::forget(running);
 }

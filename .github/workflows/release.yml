@@ -64,6 +64,10 @@ jobs:
     # Match Netcatty build-linux-arm64: Debian bullseye / glibc 2.31.
     container:
       image: debian:bullseye
+    defaults:
+      run:
+        # bullseye default shell is dash; pipefail needs bash.
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - name: Install build tools + Rust
@@ -71,7 +75,7 @@ jobs:
           set -euo pipefail
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential curl ca-certificates binutils
+            build-essential curl ca-certificates binutils bash
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Build release

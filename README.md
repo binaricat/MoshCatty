@@ -54,7 +54,7 @@ It is the default path Netcatty uses to ship a reliable multi-platform Mosh clie
 |----------|-----------------|
 | Cygwin `mosh-client` + partial DLLs | Cursor-only / terminfo / PTY sandwich failures |
 | FluentTerminal old PE | Stale provenance, encoding issues |
-| **MoshCatty** | One static-ish binary, same protocol stack everywhere |
+| **MoshCatty** | One binary (Windows CRT static-linked), same protocol stack everywhere |
 
 Peer products either skip Windows Mosh or own a private engine. MoshCatty is the open, Netcatty-aligned engine.
 
@@ -135,6 +135,26 @@ byte on stdin. MoshCatty installs a console control handler that **ignores**
 `CTRL_C` / `CTRL_BREAK` as process-kill signals, and clears cooked console input
 flags analogous to Unix `cfmakeraw` (ISIG off). Result: Ctrl+C interrupts the
 *remote* shell instead of exiting the client with `STATUS_CONTROL_C_EXIT`.
+
+### Windows CRT (no VC++ redistributable)
+
+Release builds on `x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc` use
+**static CRT linking** (`.cargo/config.toml` → `-C target-feature=+crt-static`).
+
+That embeds the C runtime into `mosh-client.exe`, so the PE does **not** import:
+
+- `VCRUNTIME140.dll`
+- `MSVCP140.dll`
+- `ucrtbase.dll` / `api-ms-win-crt-*.dll`
+
+Users without the Visual C++ Redistributable can still run the binary. Remaining
+imports are always-present OS modules (`kernel32`, `ntdll`, `ws2_32`, …).
+
+```sh
+# local Windows verify after cargo build --release
+dumpbin /dependents target/release/mosh-client.exe
+# should not list VCRUNTIME140 or api-ms-win-crt-*
+```
 
 ---
 

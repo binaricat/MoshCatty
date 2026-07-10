@@ -93,7 +93,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # .cargo/config.toml sets +crt-static for *-windows-msvc so the PE does not
+      # import VCRUNTIME140 / UCRT API-sets (see README "Windows CRT").
       - run: cargo build --release
+      - name: Assert no VC++ redistributable DLL imports
+        shell: pwsh
+        run: |
+          $exe = "target/release/mosh-client.exe"
+          $dump = & "${env:VCToolsInstallDir}bin\Hostx64\x64\dumpbin.exe" /dependents $exe 2>$null
+          if (-not $dump) {
+            # Fallback: scan PE import strings (no VS path needed)
+            $bytes = [IO.File]::ReadAllBytes((Resolve-Path $exe))
+            $text = [Text.Encoding]::ASCII.GetString($bytes)
+            $dlls = [regex]::Matches($text, '[A-Za-z0-9_\-\.]+\.dll') |
+              ForEach-Object { $_.Value.ToLowerInvariant() } | Sort-Object -Unique
+          } else {
+            $dlls = $dump | Select-String -Pattern '\.dll' | ForEach-Object {
+              ($_.Line -replace '^\s+', '').ToLowerInvariant()
+            }
+          }
+          Write-Host "Imports:"; $dlls | ForEach-Object { Write-Host "  $_" }
+          $forbidden = @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll', 'ucrtbase.dll') +
+            ($dlls | Where-Object { $_ -like 'api-ms-win-crt-*.dll' })
+          $hits = $dlls | Where-Object { $forbidden -contains $_ }
+          if ($hits) {
+            throw "Windows build still imports redistributable CRT DLLs: $($hits -join ', '). Expected +crt-static."
+          }
+          Write-Host "OK: no VCRUNTIME/UCRT redistributable imports"
       - name: Package
         shell: bash
         run: |

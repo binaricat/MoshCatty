@@ -24,6 +24,23 @@ jobs:
         run: cargo test --all-targets
       - name: cargo build --release
         run: cargo build --release
+      - name: Windows — no VC++ redistributable imports
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = "target/release/mosh-client.exe"
+          $bytes = [IO.File]::ReadAllBytes((Resolve-Path $exe))
+          $text = [Text.Encoding]::ASCII.GetString($bytes)
+          $dlls = [regex]::Matches($text, '[A-Za-z0-9_\-\.]+\.dll') |
+            ForEach-Object { $_.Value.ToLowerInvariant() } | Sort-Object -Unique
+          Write-Host "Import-ish DLL strings:"; $dlls | ForEach-Object { Write-Host "  $_" }
+          $hits = $dlls | Where-Object {
+            $_ -eq 'vcruntime140.dll' -or $_ -eq 'vcruntime140_1.dll' -or
+            $_ -eq 'msvcp140.dll' -or $_ -eq 'ucrtbase.dll' -or
+            $_ -like 'api-ms-win-crt-*.dll'
+          }
+          if ($hits) { throw "Still depends on CRT redistributable: $($hits -join ', ')" }
+          Write-Host "OK: static CRT (no VCRUNTIME/UCRT redist imports)"
 
   lint:
     name: fmt

@@ -1,7 +1,12 @@
 name: release
 
 # Build multi-platform mosh-client archives and publish a GitHub Release.
-# Tags: moshcatty-0.1.0  (consumed by Netcatty fetch-mosh-binaries)
+# Tags: moshcatty-0.1.2  (consumed by Netcatty fetch-mosh-binaries)
+#
+# Linux builds intentionally target Netcatty's packaging glibc floors:
+#   linux-x64   → almalinux:8      (glibc 2.28)
+#   linux-arm64 → debian:bullseye  (glibc 2.31)
+# so bundled mosh-client starts on the same distros as Netcatty itself.
 #
 # Manual: workflow_dispatch with version
 # Auto:   push of tags matching moshcatty-*
@@ -13,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version without prefix (e.g. 0.1.0 → tag moshcatty-0.1.0)"
+        description: "Release version without prefix (e.g. 0.1.2 → tag moshcatty-0.1.2)"
         required: true
         type: string
 
@@ -26,10 +31,21 @@ env:
 jobs:
   build-linux-x64:
     runs-on: ubuntu-latest
+    # Match Netcatty build-linux-x64: AlmaLinux 8 / glibc 2.28.
+    container:
+      image: almalinux:8
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release
+      - name: Install build tools + Rust
+        run: |
+          set -euo pipefail
+          dnf -y install gcc gcc-c++ make curl ca-certificates binutils
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build release
+        run: cargo build --release
+      - name: Assert glibc floor (≤ 2.28)
+        run: bash scripts/assert-max-glibc.sh target/release/mosh-client 2.28
       - name: Package
         run: |
           set -euo pipefail
@@ -45,10 +61,23 @@ jobs:
 
   build-linux-arm64:
     runs-on: ubuntu-24.04-arm
+    # Match Netcatty build-linux-arm64: Debian bullseye / glibc 2.31.
+    container:
+      image: debian:bullseye
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release
+      - name: Install build tools + Rust
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential curl ca-certificates binutils
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build release
+        run: cargo build --release
+      - name: Assert glibc floor (≤ 2.31)
+        run: bash scripts/assert-max-glibc.sh target/release/mosh-client 2.31
       - name: Package
         run: |
           set -euo pipefail
@@ -180,6 +209,14 @@ jobs:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: ${{ steps.tag.outputs.tag }}
           generate_release_notes: true
+          body: |
+            Pure Rust `mosh-client` for Netcatty.
+
+            **Linux glibc floors** (must match Netcatty packaging):
+            - `linux-x64`: built on AlmaLinux 8 → GLIBC ≤ 2.28
+            - `linux-arm64`: built on Debian bullseye → GLIBC ≤ 2.31
+            - Windows: static MSVC CRT (no VCRUNTIME140)
+            - macOS: universal (arm64 + x86_64)
           files: |
             dist/mosh-client-linux-x64.tar.gz
             dist/mosh-client-linux-arm64.tar.gz

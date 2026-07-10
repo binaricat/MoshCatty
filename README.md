@@ -156,6 +156,26 @@ dumpbin /dependents target/release/mosh-client.exe
 # should not list VCRUNTIME140 or api-ms-win-crt-*
 ```
 
+### Linux glibc floors (Netcatty packaging)
+
+Release Linux binaries are built on the **same distro baseline Netcatty packages
+against**, not on bare `ubuntu-latest` (which links a newer glibc and fails to
+start on older supported installs):
+
+| Target | Build image | Max required GLIBC |
+|--------|-------------|--------------------|
+| `linux-x64` | `almalinux:8` | 2.28 |
+| `linux-arm64` | `debian:bullseye` | 2.31 |
+
+CI enforces the floor with `scripts/assert-max-glibc.sh` after `cargo build
+--release`. Do not regress to host Ubuntu runners for release Linux jobs.
+
+```sh
+# after a Linux release build
+bash scripts/assert-max-glibc.sh target/release/mosh-client 2.28   # x64
+bash scripts/assert-max-glibc.sh target/release/mosh-client 2.31   # arm64
+```
+
 ---
 
 ## Architecture
@@ -193,7 +213,7 @@ Tests include RFC 7253 empty-AAD vectors, mosh-go interop vectors, fragment OOO 
 CI builds multi-platform `mosh-client` archives and publishes GitHub Releases with tags:
 
 ```text
-moshcatty-0.1.0
+moshcatty-0.1.2
 ```
 
 [Netcatty](https://github.com/binaricat/Netcatty) pulls those assets the same way it previously used `Netcatty-mosh-bin`:
@@ -201,7 +221,7 @@ moshcatty-0.1.0
 ```text
 MOSH_BIN_OWNER=binaricat
 MOSH_BIN_REPO=MoshCatty
-MOSH_BIN_RELEASE=moshcatty-0.1.0   # or resolve latest moshcatty-*
+MOSH_BIN_RELEASE=moshcatty-0.1.2   # or resolve latest moshcatty-*
 npm run fetch:mosh
 ```
 

@@ -152,6 +152,10 @@ byte on stdin. MoshCatty installs a console control handler that **ignores**
 flags analogous to Unix `cfmakeraw` (ISIG off). Result: Ctrl+C interrupts the
 *remote* shell instead of exiting the client with `STATUS_CONTROL_C_EXIT`.
 
+MoshCatty also enables virtual-terminal input before reading stdin. This keeps
+the escape sequences that ConPTY receives from terminal hosts intact, including
+arrow keys, Ctrl/Alt-modified arrows, and Alt shortcuts.
+
 ### Windows CRT (no VC++ redistributable)
 
 Release builds on `x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc` use
@@ -229,7 +233,7 @@ Tests include RFC 7253 empty-AAD vectors, mosh-go interop vectors, fragment OOO 
 CI builds multi-platform `mosh-client` archives and publishes GitHub Releases with tags:
 
 ```text
-moshcatty-0.1.3
+moshcatty-0.1.4
 ```
 
 [Netcatty](https://github.com/binaricat/Netcatty) pulls those assets the same way it previously used `Netcatty-mosh-bin`:
@@ -237,7 +241,7 @@ moshcatty-0.1.3
 ```text
 MOSH_BIN_OWNER=binaricat
 MOSH_BIN_REPO=MoshCatty
-MOSH_BIN_RELEASE=moshcatty-0.1.3   # or resolve latest moshcatty-*
+MOSH_BIN_RELEASE=moshcatty-0.1.4   # or resolve latest moshcatty-*
 npm run fetch:mosh
 ```
 

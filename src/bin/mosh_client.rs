@@ -366,9 +366,21 @@ fn enter_raw_mode_if_tty() -> Option<RawMode> {
     }
 }
 
+#[cfg(any(windows, test))]
+const WINDOWS_COOKED_INPUT_FLAGS: u32 = 0x0001 | 0x0002 | 0x0004;
+#[cfg(any(windows, test))]
+const WINDOWS_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+
+#[cfg(any(windows, test))]
+fn windows_raw_input_mode(original: u32) -> u32 {
+    (original | WINDOWS_VIRTUAL_TERMINAL_INPUT) & !WINDOWS_COOKED_INPUT_FLAGS
+}
+
 /// Windows console "raw-ish" mode: clear ENABLE_PROCESSED_INPUT so Ctrl+C is
-/// not treated solely as a process-control event. ConPTY/node-pty still often
-/// synthesizes CTRL_C_EVENT; `install_signal_flag` ignores that. Restore on drop.
+/// not treated solely as a process-control event, and enable VT input so
+/// ConPTY preserves escape sequences for arrows and modifier shortcuts.
+/// ConPTY/node-pty still often synthesizes CTRL_C_EVENT;
+/// `install_signal_flag` ignores that. Restore on drop.
 #[cfg(windows)]
 struct WindowsConsoleMode {
     handle: *mut std::ffi::c_void,
@@ -385,9 +397,6 @@ impl WindowsConsoleMode {
             fn SetConsoleMode(handle: *mut std::ffi::c_void, mode: u32) -> i32;
         }
         const STD_INPUT_HANDLE: u32 = 0xFFFFFFF6; // (u32)-10
-        const ENABLE_PROCESSED_INPUT: u32 = 0x0001;
-        const ENABLE_LINE_INPUT: u32 = 0x0002;
-        const ENABLE_ECHO_INPUT: u32 = 0x0004;
         unsafe {
             let handle = GetStdHandle(STD_INPUT_HANDLE);
             if handle.is_null() || handle == (-1isize as *mut _) {
@@ -398,8 +407,9 @@ impl WindowsConsoleMode {
                 return None;
             }
             // Drop cooked-console bits analogous to cfmakeraw / ISIG off.
-            let raw = original
-                & !(ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+            // VT input is required under ConPTY so ReadFile receives escape
+            // sequences for arrows, Alt combinations, and modified keys.
+            let raw = windows_raw_input_mode(original);
             if SetConsoleMode(handle, raw) == 0 {
                 return None;
             }
@@ -498,4 +508,20 @@ fn install_signal_flag(running: Arc<AtomicBool>) {
 #[cfg(all(not(unix), not(windows)))]
 fn install_signal_flag(running: Arc<AtomicBool>) {
     std::mem::forget(running);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_raw_mode_preserves_shortcut_escape_sequences() {
+        let original = WINDOWS_COOKED_INPUT_FLAGS | 0x0010 | 0x0080;
+        let raw = windows_raw_input_mode(original);
+
+        assert_eq!(raw & WINDOWS_COOKED_INPUT_FLAGS, 0);
+        assert_ne!(raw & WINDOWS_VIRTUAL_TERMINAL_INPUT, 0);
+        assert_ne!(raw & 0x0010, 0);
+        assert_ne!(raw & 0x0080, 0);
+    }
 }

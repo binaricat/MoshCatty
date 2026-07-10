@@ -1,0 +1,10 @@
+{
+  "name": "moshcatty-ci",
+  "private": true,
+  "scripts": {
+    "test:conpty": "node tests/windows-conpty-input.cjs"
+  },
+  "devDependencies": {
+    "node-pty": "1.1.0"
+  }
+}

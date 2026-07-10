@@ -20,6 +20,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        if: runner.os == 'Windows'
+        with:
+          node-version: 22.14.0
+          cache: npm
       - name: cargo test
         run: cargo test --all-targets
       - name: cargo build --release
@@ -29,8 +34,8 @@ jobs:
         shell: pwsh
         run: |
           cargo build --features conpty-test-probe
-          npm install --no-save --package-lock=false node-pty@1.1.0
-          node tests/windows-conpty-input.cjs
+          npm ci
+          npm run test:conpty
       - name: Windows — no VC++ redistributable imports
         if: runner.os == 'Windows'
         shell: pwsh

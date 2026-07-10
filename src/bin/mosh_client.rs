@@ -31,7 +31,7 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(all(windows, feature = "conpty-test-probe"))]
+    #[cfg(all(windows, debug_assertions, feature = "conpty-test-probe"))]
     if env::var_os("MOSHCATTY_CONPTY_TEST").is_some() {
         return run_conpty_input_probe();
     }
@@ -151,12 +151,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(all(windows, feature = "conpty-test-probe"))]
+#[cfg(all(windows, debug_assertions, feature = "conpty-test-probe"))]
 fn run_conpty_input_probe() -> Result<(), Box<dyn std::error::Error>> {
+    const MAX_PROBE_BYTES: usize = 4096;
     let expected_bytes: usize = env::var("MOSHCATTY_CONPTY_TEST_BYTES")
         .map_err(|_| "MOSHCATTY_CONPTY_TEST_BYTES is required")?
         .parse()
         .map_err(|_| "MOSHCATTY_CONPTY_TEST_BYTES must be an integer")?;
+    if expected_bytes > MAX_PROBE_BYTES {
+        return Err("MOSHCATTY_CONPTY_TEST_BYTES exceeds the probe limit".into());
+    }
     let running = Arc::new(AtomicBool::new(true));
     install_signal_flag(running);
     let _raw_guard = enter_raw_mode_if_tty()?.ok_or("ConPTY test probe requires a console")?;

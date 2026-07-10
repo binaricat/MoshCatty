@@ -31,6 +31,11 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(all(windows, feature = "conpty-test-probe"))]
+    if env::var_os("MOSHCATTY_CONPTY_TEST").is_some() {
+        return run_conpty_input_probe();
+    }
+
     let mut args: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -143,6 +148,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         thread::sleep(Duration::from_millis(2));
     }
 
+    Ok(())
+}
+
+#[cfg(all(windows, feature = "conpty-test-probe"))]
+fn run_conpty_input_probe() -> Result<(), Box<dyn std::error::Error>> {
+    let expected_bytes: usize = env::var("MOSHCATTY_CONPTY_TEST_BYTES")
+        .map_err(|_| "MOSHCATTY_CONPTY_TEST_BYTES is required")?
+        .parse()
+        .map_err(|_| "MOSHCATTY_CONPTY_TEST_BYTES must be an integer")?;
+    let running = Arc::new(AtomicBool::new(true));
+    install_signal_flag(running);
+    let _raw_guard = enter_raw_mode_if_tty()?.ok_or("ConPTY test probe requires a console")?;
+    let mut input = vec![0u8; expected_bytes];
+    io::stdin().read_exact(&mut input)?;
+    let hex = input
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    println!("MOSHCATTY_INPUT_HEX={hex}");
     Ok(())
 }
 

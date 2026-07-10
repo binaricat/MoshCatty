@@ -24,6 +24,13 @@ jobs:
         run: cargo test --all-targets
       - name: cargo build --release
         run: cargo build --release
+      - name: Windows — ConPTY shortcut input
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --features conpty-test-probe
+          npm install --no-save --package-lock=false node-pty@1.1.0
+          node tests/windows-conpty-input.cjs
       - name: Windows — no VC++ redistributable imports
         if: runner.os == 'Windows'
         shell: pwsh

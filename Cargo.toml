@@ -13,6 +13,9 @@ readme = "README.md"
 keywords = ["mosh", "ssh", "terminal", "udp", "netcatty"]
 categories = ["command-line-utilities", "network-programming"]
 
+[features]
+conpty-test-probe = []
+
 [[bin]]
 name = "mosh-client"
 path = "src/bin/mosh_client.rs"

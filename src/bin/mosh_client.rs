@@ -160,6 +160,8 @@ fn run_conpty_input_probe() -> Result<(), Box<dyn std::error::Error>> {
     let running = Arc::new(AtomicBool::new(true));
     install_signal_flag(running);
     let _raw_guard = enter_raw_mode_if_tty()?.ok_or("ConPTY test probe requires a console")?;
+    println!("MOSHCATTY_CONPTY_READY");
+    io::stdout().flush()?;
     let mut input = vec![0u8; expected_bytes];
     io::stdin().read_exact(&mut input)?;
     let hex = input

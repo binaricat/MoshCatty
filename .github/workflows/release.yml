@@ -1,7 +1,7 @@
 name: release
 
 # Build multi-platform mosh-client archives and publish a GitHub Release.
-# Tags: moshcatty-0.1.2  (consumed by Netcatty fetch-mosh-binaries)
+# Tags: moshcatty-0.1.4  (consumed by Netcatty fetch-mosh-binaries)
 #
 # Linux builds intentionally target Netcatty's packaging glibc floors:
 #   linux-x64   → almalinux:8      (glibc 2.28)
@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version without prefix (e.g. 0.1.2 → tag moshcatty-0.1.2)"
+        description: "Release version without prefix (e.g. 0.1.4 → tag moshcatty-0.1.4)"
         required: true
         type: string
 

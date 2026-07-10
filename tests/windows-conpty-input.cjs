@@ -36,6 +36,7 @@ const child = pty.spawn(executable, [], {
 
 let output = "";
 let settled = false;
+let inputSent = false;
 const timeout = setTimeout(() => {
   if (settled) return;
   settled = true;
@@ -45,7 +46,13 @@ const timeout = setTimeout(() => {
 
 child.onData((data) => {
   output += data;
-  const match = output.match(/MOSHCATTY_INPUT_HEX=([0-9a-f]+)/i);
+  if (!inputSent && output.includes("MOSHCATTY_CONPTY_READY")) {
+    inputSent = true;
+    child.write(input);
+  }
+  const match = output.match(
+    new RegExp(`MOSHCATTY_INPUT_HEX=([0-9a-f]{${expectedHex.length}})\\r?\\n`, "i"),
+  );
   if (!match || settled) return;
   settled = true;
   clearTimeout(timeout);
@@ -59,5 +66,3 @@ child.onExit(({ exitCode }) => {
   clearTimeout(timeout);
   assert.fail(`ConPTY input probe exited with ${exitCode}: ${JSON.stringify(output)}`);
 });
-
-setTimeout(() => child.write(input), 250);

@@ -24,102 +24,92 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: build (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            asset: mosh-client-linux-x64
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            asset: mosh-client-linux-arm64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            asset: mosh-client-darwin-arm64
-            # universal lipo step runs after both mac builds if we add x86;
-            # for v0.1 ship arm64 + note; Netcatty expects darwin-universal —
-            # we lipo when x86 is available.
-          - os: macos-13
-            target: x86_64-apple-darwin
-            asset: mosh-client-darwin-x64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            asset: mosh-client-win32-x64
+  build-linux-x64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p out/stage
+          cp target/release/mosh-client out/stage/mosh-client
+          chmod +x out/stage/mosh-client
+          tar -C out/stage -czf out/mosh-client-linux-x64.tar.gz mosh-client
+          (cd out && sha256sum mosh-client-linux-x64.tar.gz > mosh-client-linux-x64.tar.gz.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mosh-client-linux-x64
+          path: out/
+
+  build-linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p out/stage
+          cp target/release/mosh-client out/stage/mosh-client
+          chmod +x out/stage/mosh-client
+          tar -C out/stage -czf out/mosh-client-linux-arm64.tar.gz mosh-client
+          (cd out && sha256sum mosh-client-linux-arm64.tar.gz > mosh-client-linux-arm64.tar.gz.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mosh-client-linux-arm64
+          path: out/
+
+  build-darwin-universal:
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
-      - name: Build release
-        run: cargo build --release --target ${{ matrix.target }}
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build arm64 + x86_64 and lipo
         run: |
           set -euo pipefail
-          OUT=out
-          mkdir -p "$OUT/stage"
-          BIN=target/${{ matrix.target }}/release/mosh-client
-          cp "$BIN" "$OUT/stage/mosh-client"
-          chmod +x "$OUT/stage/mosh-client"
-          tar -C "$OUT/stage" -czf "$OUT/${{ matrix.asset }}.tar.gz" mosh-client
-          (cd "$OUT" && shasum -a 256 "${{ matrix.asset }}.tar.gz" > "${{ matrix.asset }}.tar.gz.sha256")
-          ls -la "$OUT"
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          OUT=out
-          mkdir -p "$OUT/stage"
-          BIN=target/${{ matrix.target }}/release/mosh-client.exe
-          cp "$BIN" "$OUT/stage/mosh-client.exe"
-          tar -C "$OUT/stage" -czf "$OUT/${{ matrix.asset }}.tar.gz" mosh-client.exe
-          (cd "$OUT" && sha256sum "${{ matrix.asset }}.tar.gz" > "${{ matrix.asset }}.tar.gz.sha256" || shasum -a 256 "${{ matrix.asset }}.tar.gz" > "${{ matrix.asset }}.tar.gz.sha256")
-          ls -la "$OUT"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.asset }}
-          path: out/
-
-  lipo-darwin:
-    name: lipo-darwin-universal
-    needs: build
-    runs-on: macos-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: mosh-client-darwin-arm64
-          path: arm64
-      - uses: actions/download-artifact@v4
-        with:
-          name: mosh-client-darwin-x64
-          path: x64
-      - name: Lipo universal binary
-        run: |
-          set -euo pipefail
-          mkdir -p stage out
-          tar -xzf arm64/mosh-client-darwin-arm64.tar.gz -C stage
-          mv stage/mosh-client stage/mosh-client-arm64
-          tar -xzf x64/mosh-client-darwin-x64.tar.gz -C stage
-          mv stage/mosh-client stage/mosh-client-x64
-          lipo -create -output stage/mosh-client stage/mosh-client-arm64 stage/mosh-client-x64
-          chmod +x stage/mosh-client
-          file stage/mosh-client
-          tar -C stage -czf out/mosh-client-darwin-universal.tar.gz mosh-client
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          mkdir -p out/stage
+          lipo -create \
+            -output out/stage/mosh-client \
+            target/aarch64-apple-darwin/release/mosh-client \
+            target/x86_64-apple-darwin/release/mosh-client
+          chmod +x out/stage/mosh-client
+          file out/stage/mosh-client
+          tar -C out/stage -czf out/mosh-client-darwin-universal.tar.gz mosh-client
           (cd out && shasum -a 256 mosh-client-darwin-universal.tar.gz > mosh-client-darwin-universal.tar.gz.sha256)
       - uses: actions/upload-artifact@v4
         with:
           name: mosh-client-darwin-universal
           path: out/
 
+  build-win32-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/stage
+          cp target/release/mosh-client.exe out/stage/mosh-client.exe
+          tar -C out/stage -czf out/mosh-client-win32-x64.tar.gz mosh-client.exe
+          (cd out && sha256sum mosh-client-win32-x64.tar.gz > mosh-client-win32-x64.tar.gz.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mosh-client-win32-x64
+          path: out/
+
   publish:
     name: publish-release
-    needs: [build, lipo-darwin]
+    needs: [build-linux-x64, build-linux-arm64, build-darwin-universal, build-win32-x64]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -129,14 +119,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          # Flatten each artifact dir
           for d in artifacts/*/; do
             cp -v "$d"*.tar.gz dist/ 2>/dev/null || true
           done
-          # Keep Netcatty-facing assets
           ls -la dist
           cd dist
-          # SHA256SUMS for Netcatty fetch-mosh-binaries
           {
             for f in mosh-client-linux-x64.tar.gz \
                      mosh-client-linux-arm64.tar.gz \
@@ -148,7 +135,6 @@ jobs:
             done
           } > SHA256SUMS
           cat SHA256SUMS
-          ls -la
       - name: Resolve tag
         id: tag
         run: |

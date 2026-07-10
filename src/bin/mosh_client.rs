@@ -80,7 +80,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let running = Arc::new(AtomicBool::new(true));
     install_signal_flag(running.clone());
 
-    let _raw_guard = enter_raw_mode_if_tty();
+    let _raw_guard = enter_raw_mode_if_tty()?;
 
     // Always use a stdin thread so the UDP loop never blocks (Unix+Windows).
     let stdin_rx = spawn_stdin_reader();
@@ -357,12 +357,12 @@ impl Drop for RawMode {
 }
 
 #[cfg(unix)]
-fn enter_raw_mode_if_tty() -> Option<RawMode> {
+fn enter_raw_mode_if_tty() -> io::Result<Option<RawMode>> {
     use std::os::fd::AsRawFd;
     if unsafe { libc::isatty(io::stdin().as_raw_fd()) } == 1 {
-        RawMode::enter().ok()
+        Ok(RawMode::enter().ok())
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -382,11 +382,24 @@ fn windows_vt_raw_input_mode(original: u32) -> u32 {
 }
 
 #[cfg(any(windows, test))]
-fn set_windows_raw_input_mode(original: u32, mut set_mode: impl FnMut(u32) -> bool) -> bool {
+#[derive(Debug, PartialEq, Eq)]
+enum WindowsRawInputMode {
+    VirtualTerminal,
+    Legacy,
+}
+
+#[cfg(any(windows, test))]
+fn set_windows_raw_input_mode(
+    original: u32,
+    mut set_mode: impl FnMut(u32) -> bool,
+) -> Result<WindowsRawInputMode, ()> {
     if set_mode(windows_vt_raw_input_mode(original)) {
-        return true;
+        return Ok(WindowsRawInputMode::VirtualTerminal);
     }
-    set_mode(windows_legacy_raw_input_mode(original))
+    if set_mode(windows_legacy_raw_input_mode(original)) {
+        return Ok(WindowsRawInputMode::Legacy);
+    }
+    Err(())
 }
 
 /// Windows console "raw-ish" mode: clear ENABLE_PROCESSED_INPUT so Ctrl+C is
@@ -402,7 +415,7 @@ struct WindowsConsoleMode {
 
 #[cfg(windows)]
 impl WindowsConsoleMode {
-    fn enter() -> Option<Self> {
+    fn enter() -> io::Result<Option<Self>> {
         #[link(name = "kernel32")]
         extern "system" {
             fn GetStdHandle(n_std_handle: u32) -> *mut std::ffi::c_void;
@@ -413,21 +426,23 @@ impl WindowsConsoleMode {
         unsafe {
             let handle = GetStdHandle(STD_INPUT_HANDLE);
             if handle.is_null() || handle == (-1isize as *mut _) {
-                return None;
+                return Ok(None);
             }
             let mut original = 0u32;
             if GetConsoleMode(handle, &mut original) == 0 {
-                return None;
+                return Ok(None);
             }
             // Drop cooked-console bits analogous to cfmakeraw / ISIG off.
             // VT input is required under ConPTY so ReadFile receives escape
             // sequences for arrows, Alt combinations, and modified keys. If an
             // older console rejects VT input, preserve the previous raw-mode
             // behavior so Ctrl+C still reaches the remote shell.
-            if !set_windows_raw_input_mode(original, |mode| SetConsoleMode(handle, mode) != 0) {
-                return None;
+            if set_windows_raw_input_mode(original, |mode| SetConsoleMode(handle, mode) != 0)
+                .is_err()
+            {
+                return Err(io::Error::last_os_error());
             }
-            Some(Self { handle, original })
+            Ok(Some(Self { handle, original }))
         }
     }
 }
@@ -446,13 +461,13 @@ impl Drop for WindowsConsoleMode {
 }
 
 #[cfg(windows)]
-fn enter_raw_mode_if_tty() -> Option<WindowsConsoleMode> {
+fn enter_raw_mode_if_tty() -> io::Result<Option<WindowsConsoleMode>> {
     WindowsConsoleMode::enter()
 }
 
 #[cfg(all(not(unix), not(windows)))]
-fn enter_raw_mode_if_tty() -> Option<()> {
-    None
+fn enter_raw_mode_if_tty() -> io::Result<Option<()>> {
+    Ok(None)
 }
 
 #[cfg(unix)]
@@ -540,6 +555,20 @@ mod tests {
     }
 
     #[test]
+    fn windows_raw_mode_stops_after_vt_input_succeeds() {
+        let original = WINDOWS_COOKED_INPUT_FLAGS | 0x0010;
+        let mut attempted = Vec::new();
+
+        let applied = set_windows_raw_input_mode(original, |mode| {
+            attempted.push(mode);
+            true
+        });
+
+        assert_eq!(applied, Ok(WindowsRawInputMode::VirtualTerminal));
+        assert_eq!(attempted, vec![windows_vt_raw_input_mode(original)]);
+    }
+
+    #[test]
     fn windows_raw_mode_falls_back_when_vt_input_is_rejected() {
         let original = WINDOWS_COOKED_INPUT_FLAGS | 0x0010 | 0x0080;
         let mut attempted = Vec::new();
@@ -549,7 +578,7 @@ mod tests {
             attempted.len() == 2
         });
 
-        assert!(applied);
+        assert_eq!(applied, Ok(WindowsRawInputMode::Legacy));
         assert_eq!(
             attempted,
             vec![
@@ -569,7 +598,7 @@ mod tests {
             false
         });
 
-        assert!(!applied);
+        assert_eq!(applied, Err(()));
         assert_eq!(attempts, 2);
     }
 }

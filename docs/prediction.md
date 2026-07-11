@@ -1,76 +1,69 @@
 # Local prediction (speculative echo)
 
-Status: **not production-ready** (default `MOSH_PREDICTION_DISPLAY=never`)  
+Status: **mosh-go-shaped Framebuffer path** (default `MOSH_PREDICTION_DISPLAY=adaptive`)  
 Related: [Netcatty #2121](https://github.com/binaricat/Netcatty/issues/2121)
 
-## Stock mosh (C++)
-
-Sources: `src/frontend/terminaloverlay.cc`, `stmclient.cc`, `terminaldisplay.cc`.
+## Architecture (aligned with mosh-go WASM `stateTracker`)
 
 ```text
-server framebuffer
-       │
-       ▼
- overlays.apply(predictions)   // cell overlay, optional underline (flagging)
-       │
-       ▼
- Display::new_frame(last_drawn, desired)  → single ANSI stream → real TTY
+HostBytes.hoststring
+        │
+        ▼
+ apply_ansi → host_fb          // client cell grid
+        │
+ Predictor.confirm(host_fb)    // retire matching pending
+        │
+ display = host_fb.clone()
+ Predictor.overlay(display)    // underline pending runes
+        │
+ Diff(last_shown, display)  →  single ANSI stream → PTY
+ last_shown = display
 ```
 
-| Concern | Mechanism |
-|---------|-----------|
-| Model | Full cell `Framebuffer` of host state |
-| Predict | `new_user_byte`: printable insert, BS row-shift, left/right arrow |
-| Confirm | `cull`: match host cells + frame acks / epochs |
-| Underline | Separate **flagging** hysteresis (≈80/50 ms), not always-on |
-| Adaptive | **srtt_trigger** hysteresis (≈30 ms on / 20 ms off; off only when idle) |
-| Safety | One writer: predictions never dual-write the live PTY |
+On keystroke:
 
-`Display::new_frame` uses `append_silent_move`: if the encoder's cursor is already on the target cell, it emits a **relative** glyph write (no CUP). That is correct only when the real terminal matches the encoder's model.
+```text
+Predictor.keystroke(keys)      // pending (rune,x,y); control → Reset
+display = host_fb + Overlay
+Diff(last_shown, display) → PTY
+Client.send_keys(keys)         // still UDP to server
+```
 
-## mosh-go
+**Never** write predicted glyphs as a second raw stream beside HostBytes.
 
-Source: [unixshells/mosh-go `predict.go`](https://github.com/unixshells/mosh-go/blob/main/predict.go).
+## References
 
-| Concern | Mechanism |
-|---------|-----------|
-| Model | Client `Framebuffer` |
-| Predict | Pending `(rune, x, y)` for printable only |
-| Confirm | `Confirm(fb)` cell rune match; diverge → `Reset()` |
-| Overlay | Set cell + `Attr.Under`; move cursor |
-| Control / BS | **Reset all** (simpler than stock row-shift) |
-| Adaptive | Not ported (always-on style + 500 ms expire) |
+| Source | Role |
+|--------|------|
+| [unixshells/mosh-go `predict.go`](https://github.com/unixshells/mosh-go/blob/main/predict.go) | Confirm / Overlay / Reset / ExpireStale API |
+| mosh-go `framebuffer.go` | Cell grid + Diff / fullRedraw |
+| mosh-go `cmd/mosh-wasm/state.go` | Composition order on host + keystroke |
+| stock `terminaloverlay.cc` | Full epoch/cull engine (future fidelity) |
+| stock `terminaldisplay.cc` | Why dual-write fails (`append_silent_move`) |
 
-Still **grid + overlay** — never raw echo beside HostBytes.
+## Stock vs mosh-go vs MoshCatty
 
-## MoshCatty today
-
-- Host path: stream `HostBytes.hoststring` (server-side `Display::new_frame` output).
-- No client cell grid.
-- Experimental dual-write predictor (opt-in): write `\e[4m`+char to PTY, then later stream HostBytes; clear a counter on paint.
-
-### Why dual-write breaks
-
-1. User types `l` → client writes `l`, real cursor advances.
-2. Server echoes `l`; `new_frame` often assumes cursor still at the unechoed cell and emits relative `l`.
-3. Relative host write lands at **cursor+1** → `$ ll` for one key, `$ lls` for `ls`.
-
-Clearing `outstanding` is not confirm: it does not unpaint, and unrelated HostBytes drop the counter while ghosts remain.
-
-## Correct next step (minimum)
-
-Adopt **mosh-go shape** before enabling adaptive by default:
-
-1. Parse/apply HostBytes into a client cell grid + cursor.
-2. `Confirm` + `Overlay` pending predictions on that grid.
-3. Single paint path: `diff(last_shown, host⊕overlay)` → PTY.
-4. Then port stock adaptive/flagging hysteresis.
-
-Defer full stock epoch/glitch/row-shift until the grid path works.
+| Concern | Stock C++ | mosh-go | MoshCatty now |
+|---------|-----------|---------|---------------|
+| Model | Framebuffer | Framebuffer | Framebuffer |
+| Predict | Overlay cells + BS row shift | pending (x,y) | pending (x,y) like go |
+| Confirm | cull + epochs | Confirm(fb) | Confirm(fb) |
+| Paint | new_frame(last, desired) | Diff | Diff |
+| Control/BS | tentative / row shift | **Reset all** | **Reset all** (go) |
+| Adaptive | 30/20 ms hysteresis | n/a | SRTT ≥ 20 ms |
+| Underline | flagging hysteresis | always on pending | always on pending (go) |
 
 ## Env
 
 | Value | Behavior |
 |-------|----------|
-| unset / `never` | **Default.** HostBytes only (safe). |
-| `always` / `adaptive` | Experimental dual-write; **may garble**. |
+| unset / `adaptive` | Default. Overlay when SRTT ≥ 20 ms; else HostBytes pass-through |
+| `always` | Always overlay path |
+| `never` | HostBytes pass-through only |
+
+## Modules
+
+- `src/framebuffer.rs` — cells + Diff  
+- `src/ansi_apply.rs` — HostBytes → host_fb  
+- `src/prediction.rs` — Predictor + DisplayPipeline  
+- `src/bin/mosh_client.rs` — wires pipeline  

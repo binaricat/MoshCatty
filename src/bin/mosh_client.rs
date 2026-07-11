@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use moshcatty::{Client, DisplayPreference, LocalPredictor};
+use moshcatty::{Client, DisplayPipeline, DisplayPreference};
 
 fn main() {
     if let Err(e) = run() {
@@ -95,12 +95,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // alternate screen, restore primary buffer (and cursor/mouse modes) on exit.
     // Set MOSH_NO_TERM_INIT=1 to skip (same env as upstream mosh).
     let _display = DisplaySession::enter(&mut stdout)?;
-    // Speculative local echo: DEFAULT OFF (see prediction.rs module docs).
-    // Dual-write local echo + HostBytes can double-paint (ls→lls) because
-    // server Display::new_frame often emits relative glyph writes. Stock mosh
-    // and mosh-go avoid this with a cell Framebuffer + overlay. Opt-in only via
-    // MOSH_PREDICTION_DISPLAY=adaptive|always (experimental; may garble).
-    let mut predictor = LocalPredictor::new(DisplayPreference::from_env());
+    // mosh-go / stock shape: HostBytes → client Framebuffer → Confirm →
+    // Overlay → Diff(last_shown) → single PTY stream. Never dual-write raw
+    // predicted glyphs beside HostBytes (Netcatty #2121).
+    let mut display = DisplayPipeline::new(
+        cols as usize,
+        rows as usize,
+        DisplayPreference::from_env(),
+    );
     let mut last_resize_check = Instant::now();
     let mut cur_cols = cols;
     let mut cur_rows = rows;
@@ -113,21 +115,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        // Keep adaptive prediction in sync with measured SRTT.
-        predictor.set_srtt(client.srtt());
+        display.set_srtt(client.srtt());
 
-        let paint = client.poll()?;
-        if !paint.is_empty() {
-            // Server frame is authoritative: drop outstanding guesses so the
-            // next keystroke predicts against the confirmed screen.
-            predictor.on_host_paint();
-            stdout.write_all(&paint)?;
-            stdout.flush()?;
+        let host_paint = client.poll()?;
+        if !host_paint.is_empty() {
+            let out = display.on_host_bytes(&host_paint);
+            if !out.is_empty() {
+                stdout.write_all(&out)?;
+                stdout.flush()?;
+            }
         }
 
         match stdin_rx.try_recv() {
             Ok(Some(buf)) if !buf.is_empty() => {
-                let local = predictor.predict(&buf);
+                let local = display.on_keystroke(&buf);
                 if !local.is_empty() {
                     stdout.write_all(&local)?;
                     stdout.flush()?;
@@ -138,14 +139,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // EOF: drain remaining paint briefly then exit (PTY closed).
                 let deadline = Instant::now() + Duration::from_secs(2);
                 while Instant::now() < deadline && !client.is_dead() {
-                    let paint = client.poll()?;
-                    if paint.is_empty() {
+                    let host_paint = client.poll()?;
+                    if host_paint.is_empty() {
                         thread::sleep(Duration::from_millis(10));
                         continue;
                     }
-                    predictor.on_host_paint();
-                    stdout.write_all(&paint)?;
-                    stdout.flush()?;
+                    let out = display.on_host_bytes(&host_paint);
+                    if !out.is_empty() {
+                        stdout.write_all(&out)?;
+                        stdout.flush()?;
+                    }
                 }
                 break;
             }
@@ -160,6 +163,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     cur_cols = c;
                     cur_rows = r;
                     client.resize(c, r);
+                    display.resize(c as usize, r as usize);
                 }
             }
             last_resize_check = Instant::now();

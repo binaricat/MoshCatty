@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use moshcatty::Client;
+use moshcatty::{Client, DisplayPreference, LocalPredictor};
 
 fn main() {
     if let Err(e) = run() {
@@ -95,6 +95,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // alternate screen, restore primary buffer (and cursor/mouse modes) on exit.
     // Set MOSH_NO_TERM_INIT=1 to skip (same env as upstream mosh).
     let _display = DisplaySession::enter(&mut stdout)?;
+    // Speculative local echo (underline until HostBytes confirm). Required for
+    // high-latency "feels like local" typing; see Netcatty #2121 / stock mosh.
+    let mut predictor = LocalPredictor::new(DisplayPreference::from_env());
     let mut last_resize_check = Instant::now();
     let mut cur_cols = cols;
     let mut cur_rows = rows;
@@ -107,14 +110,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
+        // Keep adaptive prediction in sync with measured SRTT.
+        predictor.set_srtt(client.srtt());
+
         let paint = client.poll()?;
         if !paint.is_empty() {
+            // Server frame is authoritative: drop outstanding guesses so the
+            // next keystroke predicts against the confirmed screen.
+            predictor.on_host_paint();
             stdout.write_all(&paint)?;
             stdout.flush()?;
         }
 
         match stdin_rx.try_recv() {
-            Ok(Some(buf)) if !buf.is_empty() => client.send_keys(&buf),
+            Ok(Some(buf)) if !buf.is_empty() => {
+                let local = predictor.predict(&buf);
+                if !local.is_empty() {
+                    stdout.write_all(&local)?;
+                    stdout.flush()?;
+                }
+                client.send_keys(&buf);
+            }
             Ok(None) => {
                 // EOF: drain remaining paint briefly then exit (PTY closed).
                 let deadline = Instant::now() + Duration::from_secs(2);
@@ -124,6 +140,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         thread::sleep(Duration::from_millis(10));
                         continue;
                     }
+                    predictor.on_host_paint();
                     stdout.write_all(&paint)?;
                     stdout.flush()?;
                 }

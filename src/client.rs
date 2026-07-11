@@ -98,6 +98,11 @@ impl Client {
         self.dead_reason.as_deref()
     }
 
+    /// Smoothed RTT from the transport, if any sample is available.
+    pub fn srtt(&self) -> Option<std::time::Duration> {
+        self.transport.srtt()
+    }
+
     /// Poll network + flush pending ticks. Returns newly painted local bytes.
     pub fn poll(&mut self) -> Result<Vec<u8>> {
         if self.dead {

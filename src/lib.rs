@@ -6,6 +6,7 @@
 //! - [`pb`] — Transport / Host / User protobuf instruction codecs
 //! - [`transport`] — State Synchronization Protocol (SSP)
 //! - [`terminal`] — apply HostBytes (Display::new_frame paint) for local output
+//! - [`prediction`] — speculative local echo with underline (stock-like)
 //! - [`client`] — high-level UDP session
 //!
 //! Built for [Netcatty](https://github.com/binaricat/Netcatty) and standalone use.
@@ -18,9 +19,11 @@ pub mod crypto;
 pub mod error;
 pub mod fragment;
 pub mod pb;
+pub mod prediction;
 pub mod terminal;
 pub mod transport;
 
 pub use client::Client;
 pub use crypto::Ocb;
 pub use error::{Error, Result};
+pub use prediction::{DisplayPreference, LocalPredictor};

@@ -143,13 +143,14 @@ impl Predictor {
                 } else if d <= FLAG_TRIGGER_LOW {
                     self.flagging = false;
                 }
-                // Glitch forces underline when many long-pending preds
-                if self.glitch_trigger > GLITCH_REPAIR_COUNT {
-                    self.flagging = true;
-                }
-                // Long-pending preds force show even on low SRTT
-                if self.glitch_trigger >= GLITCH_REPAIR_COUNT {
-                    self.show = true;
+                // Glitch only applies while predictions are still outstanding.
+                if !self.pending.is_empty() {
+                    if self.glitch_trigger > GLITCH_REPAIR_COUNT {
+                        self.flagging = true;
+                    }
+                    if self.glitch_trigger >= GLITCH_REPAIR_COUNT {
+                        self.show = true;
+                    }
                 }
             }
         }
@@ -250,14 +251,23 @@ impl Predictor {
                     self.become_tentative();
                     continue;
                 }
+                // Insert-mode: shift same-row pending at/after cursor right
+                // (mirrors stock row insert; avoids duplicate cells after arrows).
+                let cx = self.cur_x;
+                let cy = self.cur_y;
+                for p in &mut self.pending {
+                    if p.epoch == self.epoch && p.y == cy && p.x >= cx {
+                        p.x = p.x.saturating_add(1);
+                    }
+                }
                 self.pending.push(Prediction {
                     ch,
-                    x: self.cur_x,
-                    y: self.cur_y,
+                    x: cx,
+                    y: cy,
                     epoch: self.epoch,
                     at: Instant::now(),
                 });
-                self.cur_x = self.cur_x.saturating_add(1);
+                self.cur_x = cx.saturating_add(1);
                 self.active = true;
             }
         }
@@ -375,9 +385,9 @@ impl Predictor {
         }
         self.pending = next;
         self.cur_x = cx;
-        if touched || !self.pending.is_empty() {
-            self.active = true;
-        }
+        let _ = touched;
+        // Always move glass cursor on BS (including over host-echoed text).
+        self.active = true;
     }
 
     /// Stock `become_tentative`: bump epoch so old pending is ignored; keep
@@ -487,6 +497,11 @@ impl Predictor {
                 return;
             };
             if cell.ch == pred.ch {
+                // Default blank matches space pred before host echo — stall
+                // until host cursor advanced past this cell.
+                if pred.ch == ' ' && is_default_blank(cell) && fb.cur_x <= pred.x {
+                    break;
+                }
                 if Instant::now().saturating_duration_since(pred.at) < GLITCH_THRESHOLD {
                     quick = true;
                 }
@@ -504,7 +519,6 @@ impl Predictor {
         if confirmed > 0 {
             self.pending.drain(..confirmed);
             self.confirmed = self.confirmed.saturating_add(confirmed);
-            // Stock: quick confirms slowly reduce glitch_trigger
             if quick && self.glitch_trigger > 0 {
                 self.glitch_trigger -= 1;
             }
@@ -512,6 +526,7 @@ impl Predictor {
 
         if self.pending.is_empty() {
             self.active = false;
+            self.glitch_trigger = 0;
             self.cur_x = fb.cur_x;
             self.cur_y = fb.cur_y;
         }
@@ -572,6 +587,36 @@ enum ArrowParse {
 
 fn is_print(ch: char) -> bool {
     !ch.is_control()
+}
+
+fn is_default_blank(cell: &crate::framebuffer::Cell) -> bool {
+    (cell.ch == ' ' || cell.ch == '\0') && cell.attr == crate::framebuffer::Attr::default()
+}
+
+/// True if hoststring contains a full-screen or full-line wipe that blanks
+/// cells without replacing them with divergent glyphs.
+fn hoststring_is_destructive_clear(data: &[u8]) -> bool {
+    // CSI ... J (ED) or CSI ... K (EL) — stock Display erase ops.
+    let mut i = 0;
+    while i + 1 < data.len() {
+        if data[i] == 0x1b && data[i + 1] == b'[' {
+            let mut j = i + 2;
+            while j < data.len() {
+                let c = data[j];
+                j += 1;
+                if c == b'J' || c == b'K' {
+                    return true;
+                }
+                if (b'@'..=b'~').contains(&c) {
+                    break;
+                }
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    false
 }
 
 fn decode_utf8_char(data: &[u8], i: usize) -> (char, usize) {
@@ -712,6 +757,10 @@ impl DisplayPipeline {
     /// HostBytes (or raw hoststring) arrived from mosh-server.
     pub fn on_host_bytes(&mut self, hoststring: &[u8]) -> Vec<u8> {
         crate::ansi_apply::apply_ansi_with_pen(&mut self.host_fb, &mut self.pen, hoststring);
+        // Destructive clears invalidate pending (blank cells would stall Confirm).
+        if hoststring_is_destructive_clear(hoststring) {
+            self.predictor.become_tentative();
+        }
         self.predictor
             .set_cursor(self.host_fb.cur_x, self.host_fb.cur_y);
         self.predictor.confirm(&self.host_fb);

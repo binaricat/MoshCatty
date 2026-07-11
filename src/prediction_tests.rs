@@ -244,15 +244,122 @@ fn backspace_shifts_own_pending_on_row() {
     let mut p = always();
     p.set_cursor(0, 0);
     p.keystroke(b"abcd", &blank_fb());
-    // Move left twice into the middle of pending
+    // Move left twice into the middle of pending (cursor between b and c)
     p.keystroke(b"\x1b[D\x1b[D", &blank_fb());
     assert_eq!(p.cur_x(), 2);
-    // BS should delete pending at col 1 ('b') and shift 'c','d' left
+    // BS deletes col 1 ('b') and shifts c,d left → a@0, c@1, d@2
     p.keystroke(&[0x7f], &blank_fb());
     assert_eq!(p.cur_x(), 1);
-    // Remaining should be a @0, c @1, d @2 (or a + shifted)
-    assert!(p.pending_len() >= 1);
+    assert_eq!(p.pending_len(), 3);
     assert_eq!(p.pending_char(0), Some('a'));
+    assert_eq!(p.pending_pos(0), Some((0, 0)));
+    assert_eq!(p.pending_char(1), Some('c'));
+    assert_eq!(p.pending_pos(1), Some((1, 0)));
+    assert_eq!(p.pending_char(2), Some('d'));
+    assert_eq!(p.pending_pos(2), Some((2, 0)));
+}
+
+#[test]
+fn insert_mid_pending_shifts_trailing() {
+    let mut p = always();
+    p.set_cursor(0, 0);
+    p.keystroke(b"abcd", &blank_fb());
+    p.keystroke(b"\x1b[D\x1b[D", &blank_fb()); // cursor at 2
+    p.keystroke(b"x", &blank_fb());
+    // Expect a@0 b@1 x@2 c@3 d@4
+    assert_eq!(p.pending_len(), 5);
+    assert_eq!(p.pending_char(0), Some('a'));
+    assert_eq!(p.pending_pos(0), Some((0, 0)));
+    assert_eq!(p.pending_char(1), Some('b'));
+    assert_eq!(p.pending_pos(1), Some((1, 0)));
+    assert_eq!(p.pending_char(2), Some('c')); // shifted
+    assert_eq!(p.pending_pos(2), Some((3, 0)));
+    assert_eq!(p.pending_char(3), Some('d'));
+    assert_eq!(p.pending_pos(3), Some((4, 0)));
+    assert_eq!(p.pending_char(4), Some('x'));
+    assert_eq!(p.pending_pos(4), Some((2, 0)));
+    let mut fb = blank_fb();
+    p.overlay(&mut fb);
+    assert_eq!(fb.cell_at(0, 0).unwrap().ch, 'a');
+    assert_eq!(fb.cell_at(1, 0).unwrap().ch, 'b');
+    assert_eq!(fb.cell_at(2, 0).unwrap().ch, 'x');
+    assert_eq!(fb.cell_at(3, 0).unwrap().ch, 'c');
+    assert_eq!(fb.cell_at(4, 0).unwrap().ch, 'd');
+}
+
+#[test]
+fn host_bs_moves_glass_cursor() {
+    let mut p = always();
+    p.set_cursor(5, 0);
+    let mut fb = blank_fb();
+    p.keystroke(&[0x7f], &fb);
+    assert_eq!(p.cur_x(), 4);
+    assert!(p.active());
+    p.overlay(&mut fb);
+    assert_eq!(fb.cur_x, 4);
+}
+
+#[test]
+fn space_pred_stalls_on_default_blank() {
+    let mut p = always();
+    p.set_cursor(0, 0);
+    p.keystroke(b" ", &blank_fb());
+    let fb = blank_fb(); // still default blank
+    p.confirm(&fb);
+    assert_eq!(p.pending_len(), 1, "space on default blank must stall");
+    // Host advances cursor past the cell without writing non-default — still stall
+    // With cur_x > pred.x, allow confirm of space on blank
+    let mut fb2 = blank_fb();
+    fb2.cur_x = 1;
+    p.confirm(&fb2);
+    assert_eq!(p.pending_len(), 0);
+}
+
+#[test]
+fn glitch_clears_on_confirm_allows_demote() {
+    let mut p = adaptive();
+    p.set_srtt(Some(Duration::from_millis(100)));
+    p.set_cursor(0, 0);
+    p.keystroke(b"a", &blank_fb());
+    p.backdate_oldest_for_test(Duration::from_millis(300));
+    p.expire_stale(Instant::now());
+    assert!(p.glitch_trigger_for_test() >= 10);
+    // Slow confirm (aged) — still must clear glitch when pending empty
+    let mut fb = blank_fb();
+    fb.put_rune(0, 0, 'a', Attr::default());
+    fb.cur_x = 1;
+    p.confirm(&fb);
+    assert_eq!(p.pending_len(), 0);
+    assert_eq!(p.glitch_trigger_for_test(), 0);
+    p.set_srtt(Some(Duration::from_millis(5)));
+    assert!(!p.should_show(), "must demote after glitch cleared");
+}
+
+#[test]
+fn bs_all_then_adaptive_demote() {
+    let mut p = adaptive();
+    p.set_srtt(Some(Duration::from_millis(100)));
+    p.set_cursor(0, 0);
+    p.keystroke(b"xy", &blank_fb());
+    p.keystroke(&[0x7f, 0x7f], &blank_fb());
+    assert_eq!(p.pending_len(), 0);
+    p.set_srtt(Some(Duration::from_millis(5)));
+    assert!(!p.should_show());
+    assert!(!p.active());
+}
+
+#[test]
+fn destructive_el_clears_pending_pipeline() {
+    let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Always);
+    let _ = pipe.on_host_bytes(b"\x1b[H");
+    let _ = pipe.on_keystroke(b"hello");
+    assert_eq!(pipe.predictor().pending_len(), 5);
+    let _ = pipe.on_host_bytes(b"\x1b[H\x1b[K"); // home + erase line
+    assert_eq!(
+        pipe.predictor().pending_len(),
+        0,
+        "EL must invalidate pending (not ghost underline)"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -508,19 +615,18 @@ fn pipeline_demote_show_clears_overlay() {
     let _ = pipe.on_host_bytes(b"\x1b[H$ ");
     let _ = pipe.on_keystroke(b"x");
     assert!(pipe.using_overlay_path());
-    // Confirm so pending empty, then demote
     let _ = pipe.on_host_bytes(b"\x1b[1;3Hx");
     assert_eq!(pipe.predictor().pending_len(), 0);
-    let paint = pipe.set_srtt(Some(Duration::from_millis(5)));
+    let _paint = pipe.set_srtt(Some(Duration::from_millis(5)));
     assert!(!pipe.predictor().should_show());
-    assert!(!pipe.using_overlay_path() || paint.is_empty() || true);
-    // last_shown should match host without under
-    if let Some(shown) = pipe.last_shown() {
-        // host cell for x may be at col 2
-        for x in 0..10 {
-            if let Some(c) = shown.cell_at(x, 0) {
-                assert!(!c.attr.under, "no under after demote at col {x}");
-            }
+    assert!(
+        !pipe.using_overlay_path(),
+        "demote must leave overlay path"
+    );
+    let shown = pipe.last_shown().expect("last_shown after demote");
+    for x in 0..10 {
+        if let Some(c) = shown.cell_at(x, 0) {
+            assert!(!c.attr.under, "no under after demote at col {x}");
         }
     }
 }

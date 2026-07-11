@@ -95,8 +95,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // alternate screen, restore primary buffer (and cursor/mouse modes) on exit.
     // Set MOSH_NO_TERM_INIT=1 to skip (same env as upstream mosh).
     let _display = DisplaySession::enter(&mut stdout)?;
-    // Speculative local echo (underline until HostBytes confirm). Required for
-    // high-latency "feels like local" typing; see Netcatty #2121 / stock mosh.
+    // Speculative local echo: DEFAULT OFF (see prediction.rs module docs).
+    // Dual-write local echo + HostBytes can double-paint (ls→lls) because
+    // server Display::new_frame often emits relative glyph writes. Stock mosh
+    // and mosh-go avoid this with a cell Framebuffer + overlay. Opt-in only via
+    // MOSH_PREDICTION_DISPLAY=adaptive|always (experimental; may garble).
     let mut predictor = LocalPredictor::new(DisplayPreference::from_env());
     let mut last_resize_check = Instant::now();
     let mut cur_cols = cols;

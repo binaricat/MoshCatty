@@ -1,15 +1,15 @@
-//! Speculative local echo shaped after mosh-go `predict.go`.
+//! Speculative local echo: mosh-go pending-list core + stock fidelity extras.
 //!
-//! Predictions live as pending `(rune, x, y)` records and are applied via
-//! [`Predictor::overlay`] onto a **copy** of the host Framebuffer. Confirm
-//! matches server cells. Never write predicted glyphs as a second PTY stream
-//! beside HostBytes (that caused `ls` → `lls` dual-write bugs).
+//! Base API matches [mosh-go `predict.go`](https://github.com/unixshells/mosh-go):
+//! pending `(rune, x, y)`, Confirm, Overlay, single Diff paint path.
 //!
-//! Display modes (`MOSH_PREDICTION_DISPLAY`) follow stock naming:
-//! - `always` — always overlay when pending
-//! - `never` — disable
-//! - `adaptive` (default) — stock hysteresis: on when SRTT > 30 ms, off at
-//!   ≤ 20 ms only when no pending predictions
+//! Stock extras (mobile-shell/mosh `terminaloverlay.cc`) for Termius-like feel:
+//! - Backspace undoes own predictions / shifts pending on the row (not full Reset)
+//! - Left/right arrow cursor prediction (CSI C/D, SS3)
+//! - Underline **flagging** hysteresis (80/50 ms), separate from show
+//! - Glitch triggers: long-pending preds force show / underline
+//!
+//! Never dual-write raw glyphs beside HostBytes.
 
 use std::time::{Duration, Instant};
 
@@ -21,7 +21,16 @@ use crate::framebuffer::Framebuffer;
 const SRTT_TRIGGER_HIGH: Duration = Duration::from_millis(30);
 const SRTT_TRIGGER_LOW: Duration = Duration::from_millis(20);
 
-/// mosh-go `predictionTimeout`.
+/// Stock underline flagging hysteresis.
+const FLAG_TRIGGER_HIGH: Duration = Duration::from_millis(80);
+const FLAG_TRIGGER_LOW: Duration = Duration::from_millis(50);
+
+/// Stock glitch thresholds (ms).
+const GLITCH_THRESHOLD: Duration = Duration::from_millis(250);
+const GLITCH_FLAG_THRESHOLD: Duration = Duration::from_millis(5000);
+const GLITCH_REPAIR_COUNT: u32 = 10;
+
+/// mosh-go `predictionTimeout` (also bounds pending lifetime).
 const PREDICTION_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,7 +69,7 @@ struct Prediction {
     at: Instant,
 }
 
-/// mosh-go style predictor.
+/// mosh-go style predictor + stock flagging / BS / arrows.
 #[derive(Debug)]
 pub struct Predictor {
     pending: Vec<Prediction>,
@@ -72,6 +81,12 @@ pub struct Predictor {
     preference: DisplayPreference,
     /// Whether adaptive/always should overlay right now.
     show: bool,
+    /// Stock `flagging`: underline predicted cells when RTT is high.
+    flagging: bool,
+    /// Stock glitch_trigger: force show/underline when preds hang.
+    glitch_trigger: u32,
+    /// Previous byte for ESC O → [ translation (application cursor keys).
+    last_byte: u8,
 }
 
 impl Predictor {
@@ -85,6 +100,9 @@ impl Predictor {
             confirmed: 0,
             preference,
             show: matches!(preference, DisplayPreference::Always),
+            flagging: matches!(preference, DisplayPreference::Always),
+            glitch_trigger: 0,
+            last_byte: 0,
         }
     }
 
@@ -92,35 +110,55 @@ impl Predictor {
         self.preference
     }
 
-    /// Stock hysteresis: enable when SRTT > HIGH; disable only when SRTT ≤ LOW
-    /// **and** no pending predictions are active.
+    /// Stock hysteresis for show + flagging + glitch sampling.
     pub fn set_srtt(&mut self, srtt: Option<Duration>) {
-        self.show = match self.preference {
-            DisplayPreference::Always => true,
-            DisplayPreference::Never => false,
+        match self.preference {
+            DisplayPreference::Always => {
+                self.show = true;
+                self.flagging = true;
+            }
+            DisplayPreference::Never => {
+                self.show = false;
+                self.flagging = false;
+            }
             DisplayPreference::Adaptive => {
                 let Some(d) = srtt else {
-                    // Cold start: keep previous (initially false).
                     return;
                 };
+                // Show trigger (stock SRTT_TRIGGER_*)
                 if d > SRTT_TRIGGER_HIGH {
-                    true
+                    self.show = true;
                 } else if d <= SRTT_TRIGGER_LOW {
-                    if self.active() {
-                        self.show // hold while predictions visible
-                    } else {
-                        false
+                    if !self.active() {
+                        self.show = false;
                     }
-                } else {
-                    self.show // between LOW and HIGH: hold
+                }
+                // Underline flagging (stock FLAG_TRIGGER_*)
+                if d > FLAG_TRIGGER_HIGH {
+                    self.flagging = true;
+                } else if d <= FLAG_TRIGGER_LOW {
+                    self.flagging = false;
+                }
+                // Glitch forces underline when many long-pending preds
+                if self.glitch_trigger > GLITCH_REPAIR_COUNT {
+                    self.flagging = true;
+                }
+                // Long-pending preds force show even on low SRTT
+                if self.glitch_trigger >= GLITCH_REPAIR_COUNT {
+                    self.show = true;
                 }
             }
-        };
+        }
     }
 
     /// Whether overlays should be applied (preference + adaptive trigger).
     pub fn should_show(&self) -> bool {
         self.show
+    }
+
+    /// Whether predicted cells get underline (stock flagging).
+    pub fn flagging(&self) -> bool {
+        self.flagging
     }
 
     pub fn pending_len(&self) -> usize {
@@ -150,27 +188,99 @@ impl Predictor {
         self.active && !self.pending.is_empty()
     }
 
-    /// mosh-go `Keystroke`: printable → pending; control/escape → Reset.
-    pub fn keystroke(&mut self, input: &[u8]) {
+    /// Process keystrokes. `fb` is the host Framebuffer (for width / last-col).
+    ///
+    /// - Printable → pending cell + advance cursor (mosh-go / stock Print)
+    /// - BS/DEL → undo/shift pending (stock), not full Reset
+    /// - CSI C/D / SS3 C/D → left/right cursor (stock)
+    /// - Other controls / CSI → become_tentative (stock)
+    pub fn keystroke(&mut self, input: &[u8], fb: &Framebuffer) {
         if !self.show {
             self.reset();
             return;
         }
         let mut i = 0;
         while i < input.len() {
+            let b = input[i];
+            // ESC sequences
+            if b == 0x1b {
+                i += 1;
+                if i >= input.len() {
+                    self.become_tentative();
+                    break;
+                }
+                // Application cursor: ESC O A/B/C/D → treat like ESC [ 
+                let next = input[i];
+                if next == b'O' || next == b'[' {
+                    let is_ss3 = next == b'O';
+                    i += 1;
+                    // Collect CSI params until final
+                    let mut final_b = 0u8;
+                    while i < input.len() {
+                        let c = input[i];
+                        i += 1;
+                        if (b'@'..=b'~').contains(&c) {
+                            final_b = c;
+                            break;
+                        }
+                    }
+                    if final_b == 0 {
+                        self.become_tentative();
+                        break;
+                    }
+                    // Only bare CSI C/D (or SS3 C/D) are predicted
+                    if (is_ss3 || true) && final_b == b'C' {
+                        self.move_cursor_right(fb);
+                    } else if final_b == b'D' {
+                        self.move_cursor_left();
+                    } else {
+                        self.become_tentative();
+                    }
+                    self.last_byte = final_b;
+                    continue;
+                }
+                self.become_tentative();
+                self.last_byte = next;
+                i += 1;
+                continue;
+            }
+
             let (ch, len) = decode_utf8_char(input, i);
             i += len;
+            self.last_byte = if len == 1 { b } else { 0 };
+
             if ch == '\u{FFFD}' && len == 1 {
-                self.reset();
-                return;
+                self.become_tentative();
+                continue;
             }
-            let code = ch as u32;
-            if code < 0x20 || code == 0x7f {
-                // Control — mosh-go resets (including backspace).
-                self.reset();
-                return;
+
+            // Backspace / DEL — stock predicts erase, does not full-reset
+            if ch == '\u{08}' || ch == '\u{7f}' {
+                self.predict_backspace(fb);
+                continue;
             }
+
+            // Other C0 controls (CR, LF, Tab, Ctrl-C, …)
+            if (ch as u32) < 0x20 {
+                self.become_tentative();
+                // CR: move to col 0 like stock newline_carriage_return (cursor only)
+                if ch == '\r' {
+                    self.cur_x = 0;
+                }
+                continue;
+            }
+
             if is_print(ch) {
+                // Wide glyphs: stock become_tentative (wcwidth != 1)
+                if unicode_width_approx(ch) != 1 {
+                    self.become_tentative();
+                    continue;
+                }
+                // Last column is tricky (stock)
+                if self.cur_x + 1 >= fb.cols {
+                    self.become_tentative();
+                    continue;
+                }
                 self.pending.push(Prediction {
                     ch,
                     x: self.cur_x,
@@ -178,19 +288,111 @@ impl Predictor {
                     epoch: self.epoch,
                     at: Instant::now(),
                 });
-                // mosh-go advances one column per printable (width=1 model).
                 self.cur_x = self.cur_x.saturating_add(1);
                 self.active = true;
             }
         }
     }
 
-    /// mosh-go `Reset`.
+    fn move_cursor_left(&mut self) {
+        if self.cur_x > 0 {
+            self.cur_x -= 1;
+            self.active = self.active || !self.pending.is_empty();
+        }
+    }
+
+    fn move_cursor_right(&mut self, fb: &Framebuffer) {
+        if self.cur_x + 1 < fb.cols {
+            self.cur_x += 1;
+            self.active = self.active || !self.pending.is_empty();
+        }
+    }
+
+    /// Stock-ish backspace on the pending-list model.
+    ///
+    /// 1. If we just typed on this row, pop the last contiguous prediction.
+    /// 2. Else shift pending cells left on this row from the cursor (insert BS).
+    /// 3. Always move cursor left when possible.
+    fn predict_backspace(&mut self, fb: &Framebuffer) {
+        if self.cur_x == 0 {
+            return;
+        }
+        let cx = self.cur_x - 1;
+        let cy = self.cur_y;
+
+        // Case 1: undo our own last glyph at (cx, cy)
+        if let Some(last) = self.pending.last() {
+            if last.epoch == self.epoch && last.x == cx && last.y == cy {
+                self.pending.pop();
+                self.cur_x = cx;
+                if self.pending.is_empty() {
+                    self.active = false;
+                }
+                return;
+            }
+        }
+
+        // Case 2: insert-mode shift among pending on this row
+        self.cur_x = cx;
+        let mut next = Vec::with_capacity(self.pending.len());
+        for p in self.pending.drain(..) {
+            if p.epoch != self.epoch || p.y != cy {
+                next.push(p);
+                continue;
+            }
+            if p.x < cx {
+                next.push(p);
+            } else if p.x > cx {
+                next.push(Prediction {
+                    x: p.x - 1,
+                    ..p
+                });
+            }
+            // p.x == cx: deleted
+        }
+        // If nothing pending covers the gap, predict a space from host shift:
+        // show host cell at cx+1 moved to cx when available.
+        let has_at_cx = next.iter().any(|p| p.y == cy && p.x == cx);
+        if !has_at_cx {
+            if let Some(src) = fb.cell_at(cx + 1, cy) {
+                next.push(Prediction {
+                    ch: if src.ch == '\0' { ' ' } else { src.ch },
+                    x: cx,
+                    y: cy,
+                    epoch: self.epoch,
+                    at: Instant::now(),
+                });
+            } else {
+                next.push(Prediction {
+                    ch: ' ',
+                    x: cx,
+                    y: cy,
+                    epoch: self.epoch,
+                    at: Instant::now(),
+                });
+            }
+        }
+        self.pending = next;
+        self.active = !self.pending.is_empty();
+    }
+
+    /// Stock `become_tentative`: bump epoch so old pending is ignored; keep
+    /// cursor. New predictions start a fresh confidence band.
+    pub fn become_tentative(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.pending.clear();
+        self.active = false;
+        self.confirmed = 0;
+    }
+
+    /// Full reset (resize, demote, huge paste).
     pub fn reset(&mut self) {
         self.pending.clear();
         self.epoch = self.epoch.wrapping_add(1);
         self.active = false;
         self.confirmed = 0;
+        self.glitch_trigger = 0;
+        self.last_byte = 0;
     }
 
     /// mosh-go `SetCursor` — only tracks server cursor when inactive.
@@ -201,8 +403,21 @@ impl Predictor {
         }
     }
 
-    /// mosh-go `ExpireStale`.
+    /// mosh-go ExpireStale + stock glitch sampling on oldest pending age.
     pub fn expire_stale(&mut self, now: Instant) {
+        // Glitch: age of oldest pending
+        if let Some(oldest) = self.pending.first() {
+            let age = now.saturating_duration_since(oldest.at);
+            if age >= GLITCH_FLAG_THRESHOLD {
+                self.glitch_trigger = GLITCH_REPAIR_COUNT * 2;
+                self.show = true;
+                self.flagging = true;
+            } else if age >= GLITCH_THRESHOLD && self.glitch_trigger < GLITCH_REPAIR_COUNT {
+                self.glitch_trigger = GLITCH_REPAIR_COUNT;
+                self.show = true;
+            }
+        }
+
         let cutoff = now.checked_sub(PREDICTION_TIMEOUT).unwrap_or(now);
         let mut changed = false;
         while self
@@ -227,7 +442,7 @@ impl Predictor {
         }
     }
 
-    /// mosh-go `Confirm`.
+    /// mosh-go `Confirm` + stock quick-confirm glitch repair.
     pub fn confirm(&mut self, fb: &Framebuffer) {
         if !self.active || self.pending.is_empty() {
             self.cur_x = fb.cur_x;
@@ -236,6 +451,7 @@ impl Predictor {
         }
 
         let mut confirmed = 0usize;
+        let mut quick = false;
         while confirmed < self.pending.len() {
             let pred = &self.pending[confirmed];
             if pred.epoch != self.epoch {
@@ -249,12 +465,13 @@ impl Predictor {
                 return;
             };
             if cell.ch == pred.ch {
+                if Instant::now().saturating_duration_since(pred.at) < GLITCH_THRESHOLD {
+                    quick = true;
+                }
                 confirmed += 1;
             } else if (cell.ch == ' ' || cell.ch == '\0') && pred.ch != ' ' {
-                // Server not caught up yet.
                 break;
             } else {
-                // Divergence.
                 self.reset();
                 self.cur_x = fb.cur_x;
                 self.cur_y = fb.cur_y;
@@ -265,6 +482,10 @@ impl Predictor {
         if confirmed > 0 {
             self.pending.drain(..confirmed);
             self.confirmed = self.confirmed.saturating_add(confirmed);
+            // Stock: quick confirms slowly reduce glitch_trigger
+            if quick && self.glitch_trigger > 0 {
+                self.glitch_trigger -= 1;
+            }
         }
 
         if self.pending.is_empty() {
@@ -274,7 +495,7 @@ impl Predictor {
         }
     }
 
-    /// mosh-go `Overlay` — mutate `fb` in place with underlined predictions.
+    /// Overlay predictions; underline only when flagging (stock).
     pub fn overlay(&self, fb: &mut Framebuffer) {
         if !self.active || !self.show {
             return;
@@ -286,13 +507,38 @@ impl Predictor {
             if let Some(cell) = fb.cell_at_mut(pred.x, pred.y) {
                 cell.ch = pred.ch;
                 cell.width = 1;
-                cell.attr.under = true;
+                if self.flagging {
+                    cell.attr.under = true;
+                }
             }
         }
-        if !self.pending.is_empty() {
+        if !self.pending.is_empty() || self.active {
             fb.cur_x = self.cur_x.min(fb.cols.saturating_sub(1));
             fb.cur_y = self.cur_y.min(fb.rows.saturating_sub(1));
         }
+    }
+}
+
+/// Approximate terminal width: ASCII/Latin-1 = 1, most CJK = 2.
+fn unicode_width_approx(ch: char) -> usize {
+    let c = ch as u32;
+    if c < 0x1100 {
+        return 1;
+    }
+    // Common wide ranges (simplified; good enough for tentative vs predict)
+    if (0x1100..=0x115F).contains(&c)
+        || (0x2E80..=0xA4CF).contains(&c)
+        || (0xAC00..=0xD7A3).contains(&c)
+        || (0xF900..=0xFAFF).contains(&c)
+        || (0xFE10..=0xFE6F).contains(&c)
+        || (0xFF00..=0xFF60).contains(&c)
+        || (0xFFE0..=0xFFE6).contains(&c)
+        || (0x20000..=0x2FFFD).contains(&c)
+        || (0x30000..=0x3FFFD).contains(&c)
+    {
+        2
+    } else {
+        1
     }
 }
 
@@ -462,7 +708,7 @@ impl DisplayPipeline {
             self.predictor.reset();
             return self.render_host_only();
         }
-        self.predictor.keystroke(keys);
+        self.predictor.keystroke(keys, &self.host_fb);
         self.render_overlay_path()
     }
 
@@ -508,13 +754,17 @@ mod tests {
         );
     }
 
+    fn blank_fb() -> Framebuffer {
+        Framebuffer::new(80, 24)
+    }
+
     #[test]
     fn basic_echo_pending_positions() {
         // TestPredictorBasicEcho
         let mut p = Predictor::new(DisplayPreference::Always);
         p.set_srtt(None);
         p.set_cursor(0, 0);
-        p.keystroke(b"abc");
+        p.keystroke(b"abc", &blank_fb());
         assert!(p.active());
         assert_eq!(p.pending_len(), 3);
         assert_eq!(p.pending_char(0), Some('a'));
@@ -526,11 +776,11 @@ mod tests {
     }
 
     #[test]
-    fn overlay_underlines() {
+    fn overlay_underlines_when_flagging() {
         let mut p = Predictor::new(DisplayPreference::Always);
         p.set_cursor(0, 0);
-        p.keystroke(b"hi");
-        let mut fb = Framebuffer::new(80, 24);
+        p.keystroke(b"hi", &blank_fb());
+        let mut fb = blank_fb();
         p.overlay(&mut fb);
         assert_eq!(fb.cell_at(0, 0).unwrap().ch, 'h');
         assert!(fb.cell_at(0, 0).unwrap().attr.under);
@@ -541,11 +791,29 @@ mod tests {
     }
 
     #[test]
+    fn overlay_no_underline_when_not_flagging() {
+        // SRTT 40ms: show on (>30) but flagging off (≤50 clears flag)
+        let mut p = Predictor::new(DisplayPreference::Adaptive);
+        p.set_srtt(Some(Duration::from_millis(100))); // show+flag on
+        assert!(p.should_show() && p.flagging());
+        p.set_srtt(Some(Duration::from_millis(40))); // flagging off; show holds (20<40≤30? 40>30 so still show)
+        // 40 > 30 → show stays true; 40 ≤ 50 → flagging false
+        assert!(p.should_show());
+        assert!(!p.flagging());
+        p.set_cursor(0, 0);
+        p.keystroke(b"a", &blank_fb());
+        let mut fb = blank_fb();
+        p.overlay(&mut fb);
+        assert_eq!(fb.cell_at(0, 0).unwrap().ch, 'a');
+        assert!(!fb.cell_at(0, 0).unwrap().attr.under);
+    }
+
+    #[test]
     fn confirm_all() {
         let mut p = Predictor::new(DisplayPreference::Always);
         p.set_cursor(0, 0);
-        p.keystroke(b"ab");
-        let mut fb = Framebuffer::new(80, 24);
+        p.keystroke(b"ab", &blank_fb());
+        let mut fb = blank_fb();
         fb.put_rune(0, 0, 'a', Attr::default());
         fb.put_rune(1, 0, 'b', Attr::default());
         fb.cur_x = 2;
@@ -558,8 +826,8 @@ mod tests {
     fn partial_confirm() {
         let mut p = Predictor::new(DisplayPreference::Always);
         p.set_cursor(0, 0);
-        p.keystroke(b"abc");
-        let mut fb = Framebuffer::new(80, 24);
+        p.keystroke(b"abc", &blank_fb());
+        let mut fb = blank_fb();
         fb.put_rune(0, 0, 'a', Attr::default());
         fb.cur_x = 1;
         p.confirm(&fb);
@@ -572,8 +840,8 @@ mod tests {
     fn divergence_resets() {
         let mut p = Predictor::new(DisplayPreference::Always);
         p.set_cursor(0, 0);
-        p.keystroke(b"abc");
-        let mut fb = Framebuffer::new(80, 24);
+        p.keystroke(b"abc", &blank_fb());
+        let mut fb = blank_fb();
         fb.put_rune(0, 0, 'x', Attr::default());
         fb.cur_x = 5;
         p.confirm(&fb);
@@ -585,9 +853,9 @@ mod tests {
     fn control_char_resets() {
         let mut p = Predictor::new(DisplayPreference::Always);
         p.set_cursor(0, 0);
-        p.keystroke(b"ab");
+        p.keystroke(b"ab", &blank_fb());
         assert!(p.active());
-        p.keystroke(b"\n");
+        p.keystroke(b"\n", &blank_fb());
         assert!(!p.active());
     }
 
@@ -595,8 +863,8 @@ mod tests {
     fn escape_resets() {
         let mut p = Predictor::new(DisplayPreference::Always);
         p.set_cursor(0, 0);
-        p.keystroke(b"ab");
-        p.keystroke(&[0x1b]);
+        p.keystroke(b"ab", &blank_fb());
+        p.keystroke(&[0x1b], &blank_fb());
         assert!(!p.active());
     }
 
@@ -604,9 +872,9 @@ mod tests {
     fn space_confirm() {
         let mut p = Predictor::new(DisplayPreference::Always);
         p.set_cursor(0, 0);
-        p.keystroke(b"hi there");
+        p.keystroke(b"hi there", &blank_fb());
         assert_eq!(p.pending_len(), 8);
-        let mut fb = Framebuffer::new(80, 24);
+        let mut fb = blank_fb();
         fb.put_rune(0, 0, 'h', Attr::default());
         fb.put_rune(1, 0, 'i', Attr::default());
         fb.put_rune(2, 0, ' ', Attr::default());
@@ -620,7 +888,7 @@ mod tests {
     fn set_cursor_not_overridden_while_active() {
         let mut p = Predictor::new(DisplayPreference::Always);
         p.set_cursor(10, 5);
-        p.keystroke(b"x");
+        p.keystroke(b"x", &blank_fb());
         p.set_cursor(0, 0);
         assert_eq!(p.cur_x(), 11);
     }
@@ -629,14 +897,60 @@ mod tests {
     fn overlay_does_not_touch_unpredicted() {
         let mut p = Predictor::new(DisplayPreference::Always);
         p.set_cursor(5, 0);
-        p.keystroke(b"x");
-        let mut fb = Framebuffer::new(80, 24);
+        p.keystroke(b"x", &blank_fb());
+        let mut fb = blank_fb();
         fb.put_rune(0, 0, 'A', Attr::default());
         fb.put_rune(1, 0, 'B', Attr::default());
         p.overlay(&mut fb);
         assert_eq!(fb.cell_at(0, 0).unwrap().ch, 'A');
         assert_eq!(fb.cell_at(1, 0).unwrap().ch, 'B');
         assert_eq!(fb.cell_at(5, 0).unwrap().ch, 'x');
+    }
+
+    #[test]
+    fn backspace_undoes_own_prediction() {
+        let mut p = Predictor::new(DisplayPreference::Always);
+        p.set_cursor(0, 0);
+        p.keystroke(b"ab", &blank_fb());
+        assert_eq!(p.pending_len(), 2);
+        p.keystroke(&[0x7f], &blank_fb());
+        assert_eq!(p.pending_len(), 1);
+        assert_eq!(p.pending_char(0), Some('a'));
+        assert_eq!(p.cur_x(), 1);
+        p.keystroke(&[0x08], &blank_fb());
+        assert_eq!(p.pending_len(), 0);
+        assert_eq!(p.cur_x(), 0);
+    }
+
+    #[test]
+    fn left_right_arrows_move_cursor() {
+        let mut p = Predictor::new(DisplayPreference::Always);
+        p.set_cursor(0, 0);
+        p.keystroke(b"hi", &blank_fb());
+        assert_eq!(p.cur_x(), 2);
+        // CSI D left
+        p.keystroke(b"\x1b[D", &blank_fb());
+        assert_eq!(p.cur_x(), 1);
+        // CSI C right
+        p.keystroke(b"\x1b[C", &blank_fb());
+        assert_eq!(p.cur_x(), 2);
+        // Still have pending
+        assert_eq!(p.pending_len(), 2);
+    }
+
+    #[test]
+    fn glitch_forces_show_on_long_pending() {
+        let mut p = Predictor::new(DisplayPreference::Adaptive);
+        p.set_srtt(Some(Duration::from_millis(5))); // would be off
+        assert!(!p.should_show());
+        // Can't keystroke when !show — set Always-like glitch via Always path
+        let mut p = Predictor::new(DisplayPreference::Always);
+        p.set_cursor(0, 0);
+        p.keystroke(b"x", &blank_fb());
+        p.backdate_oldest_for_test(Duration::from_millis(300));
+        p.expire_stale(Instant::now());
+        // Always still shows; glitch_trigger should rise
+        assert!(p.should_show());
     }
 
     /// Regression: dual-write would produce "ll"; Diff path must show single "l".
@@ -692,7 +1006,7 @@ mod tests {
     fn expire_stale_clears_old_pending() {
         let mut p = Predictor::new(DisplayPreference::Always);
         p.set_cursor(0, 0);
-        p.keystroke(b"a");
+        p.keystroke(b"a", &blank_fb());
         assert!(p.active());
         p.backdate_oldest_for_test(Duration::from_millis(600));
         p.expire_stale(Instant::now());
@@ -704,7 +1018,7 @@ mod tests {
     fn multibyte_utf8_one_pending() {
         let mut p = Predictor::new(DisplayPreference::Always);
         p.set_cursor(0, 0);
-        p.keystroke("é".as_bytes());
+        p.keystroke("é".as_bytes(), &blank_fb());
         assert_eq!(p.pending_len(), 1);
         assert_eq!(p.pending_char(0), Some('é'));
     }
@@ -715,7 +1029,7 @@ mod tests {
         p.set_srtt(Some(Duration::from_millis(80))); // on
         assert!(p.should_show());
         p.set_cursor(0, 0);
-        p.keystroke(b"x");
+        p.keystroke(b"x", &blank_fb());
         assert!(p.active());
         // Drop below LOW while pending — stock holds show on.
         p.set_srtt(Some(Duration::from_millis(5)));

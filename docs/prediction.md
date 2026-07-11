@@ -1,71 +1,53 @@
 # Local prediction (speculative echo)
 
-Status: **mosh-go-shaped Framebuffer path** (default `MOSH_PREDICTION_DISPLAY=adaptive`)  
+Status: **mosh-go core + stock fidelity extras** (default `adaptive`)  
 Related: [Netcatty #2121](https://github.com/binaricat/Netcatty/issues/2121)
 
-## Architecture (aligned with mosh-go WASM `stateTracker`)
+## Architecture
 
 ```text
 HostBytes.hoststring
         │
         ▼
- apply_ansi → host_fb          // client cell grid
+ apply_ansi → host_fb
         │
- Predictor.confirm(host_fb)    // retire matching pending
+ Predictor.confirm(host_fb)
         │
  display = host_fb.clone()
- Predictor.overlay(display)    // underline pending runes
+ Predictor.overlay(display)   // underline iff flagging
         │
- Diff(last_shown, display)  →  single ANSI stream → PTY
- last_shown = display
+ Diff(last_shown, display) → single ANSI → PTY
 ```
 
-On keystroke:
+Keystroke path: `Predictor.keystroke(keys, host_fb)` → same Diff path.  
+Never dual-write raw predicted glyphs beside HostBytes.
 
-```text
-Predictor.keystroke(keys)      // pending (rune,x,y); control → Reset
-display = host_fb + Overlay
-Diff(last_shown, display) → PTY
-Client.send_keys(keys)         // still UDP to server
-```
+## Alignment matrix
 
-**Never** write predicted glyphs as a second raw stream beside HostBytes.
-
-## References
-
-| Source | Role |
-|--------|------|
-| [unixshells/mosh-go `predict.go`](https://github.com/unixshells/mosh-go/blob/main/predict.go) | Confirm / Overlay / Reset / ExpireStale API |
-| mosh-go `framebuffer.go` | Cell grid + Diff / fullRedraw |
-| mosh-go `cmd/mosh-wasm/state.go` | Composition order on host + keystroke |
-| stock `terminaloverlay.cc` | Full epoch/cull engine (future fidelity) |
-| stock `terminaldisplay.cc` | Why dual-write fails (`append_silent_move`) |
-
-## Stock vs mosh-go vs MoshCatty
-
-| Concern | Stock C++ | mosh-go | MoshCatty now |
-|---------|-----------|---------|---------------|
+| Concern | Stock C++ | mosh-go | MoshCatty |
+|---------|-----------|---------|-----------|
 | Model | Framebuffer | Framebuffer | Framebuffer |
-| Predict | Overlay cells + BS row shift | pending (x,y) | pending (x,y) like go |
+| Paint | new_frame single stream | Diff | Diff |
 | Confirm | cull + epochs | Confirm(fb) | Confirm(fb) |
-| Paint | new_frame(last, desired) | Diff | Diff |
-| Control/BS | tentative / row shift | **Reset all** | **Reset all** (go) |
-| Adaptive | 30/20 ms hysteresis; demote only if idle | n/a | 30/20 ms hysteresis; demote only if idle (stock) |
-| Underline | flagging hysteresis | always on pending | always on pending (go) |
-| Expire | glitch timers | 500 ms stale | 500 ms + client `tick` |
-| Demote repaint | re-diff host FB | n/a | Diff host-only before passthrough |
+| Printable | insert + advance | pending (x,y) | pending (x,y) |
+| Backspace | row shift / overwrite | **Reset all** | **undo + row shift pending** (stock-ish) |
+| Left/right | CSI C/D | none | CSI C/D + SS3 |
+| Other CSI/control | become_tentative | Reset | become_tentative |
+| Show adaptive | 30/20 ms + !active | n/a | 30/20 ms + !active |
+| Underline | flagging 80/50 ms | always | flagging 80/50 ms |
+| Glitch | 250ms show / 5s flag | 500ms expire | both |
+| Wide glyph | tentative | treat as print | tentative (width≠1) |
+| Last column | tentative | n/a | tentative |
+| Bulk paste | reset >100 | always | reset >100 |
 
 ## Env
 
 | Value | Behavior |
 |-------|----------|
-| unset / `adaptive` | Default. Overlay when SRTT ≥ 20 ms; else HostBytes pass-through |
-| `always` | Always overlay path |
+| `adaptive` (default) | Show when SRTT >30ms; underline when >80ms |
+| `always` | Always show + underline |
 | `never` | HostBytes pass-through only |
 
 ## Modules
 
-- `src/framebuffer.rs` — cells + Diff  
-- `src/ansi_apply.rs` — HostBytes → host_fb  
-- `src/prediction.rs` — Predictor + DisplayPipeline  
-- `src/bin/mosh_client.rs` — wires pipeline  
+- `framebuffer.rs` / `ansi_apply.rs` / `prediction.rs` / `mosh_client.rs`

@@ -86,6 +86,8 @@ pub struct Framebuffer {
     pub cur_x: usize,
     pub cur_y: usize,
     pub cursor_visible: bool,
+    /// Stock DrawState `next_print_will_wrap` — last-col print defers wrap to next char.
+    pub next_print_will_wrap: bool,
 }
 
 impl Framebuffer {
@@ -99,6 +101,7 @@ impl Framebuffer {
             cur_x: 0,
             cur_y: 0,
             cursor_visible: true,
+            next_print_will_wrap: false,
         }
     }
 
@@ -121,6 +124,7 @@ impl Framebuffer {
         next.cur_x = self.cur_x.min(cols.saturating_sub(1));
         next.cur_y = self.cur_y.min(rows.saturating_sub(1));
         next.cursor_visible = self.cursor_visible;
+        next.next_print_will_wrap = false;
         *self = next;
     }
 
@@ -445,15 +449,22 @@ mod tests {
     fn diff_emits_changed_glyph() {
         let old = Framebuffer::new(10, 5);
         let mut new = old.clone();
-        new.put_rune(0, 0, 'a', Attr {
-            under: true,
-            ..Attr::default()
-        });
+        new.put_rune(
+            0,
+            0,
+            'a',
+            Attr {
+                under: true,
+                ..Attr::default()
+            },
+        );
         new.cur_x = 1;
         let paint = new.diff(Some(&old));
         assert!(paint.windows(1).any(|w| w == b"a"));
         // underline SGR
-        assert!(paint.windows(3).any(|w| w == b"\x1b[4" || w.starts_with(b"\x1b[")));
+        assert!(paint
+            .windows(3)
+            .any(|w| w == b"\x1b[4" || w.starts_with(b"\x1b[")));
         assert!(String::from_utf8_lossy(&paint).contains('a'));
     }
 
@@ -465,7 +476,6 @@ mod tests {
         assert!(paint.windows(4).any(|w| w == b"\x1b[2J"));
     }
 }
-
 
 /// Approximate terminal cell width for host modeling (1 or 2).
 fn rune_display_width(ch: char) -> usize {

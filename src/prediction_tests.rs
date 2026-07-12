@@ -25,11 +25,26 @@ fn adaptive() -> Predictor {
 
 #[test]
 fn env_preference_parsing() {
-    assert_eq!(DisplayPreference::from_env_value("always"), DisplayPreference::Always);
-    assert_eq!(DisplayPreference::from_env_value("NEVER"), DisplayPreference::Never);
-    assert_eq!(DisplayPreference::from_env_value("adaptive"), DisplayPreference::Adaptive);
-    assert_eq!(DisplayPreference::from_env_value(""), DisplayPreference::Adaptive);
-    assert_eq!(DisplayPreference::from_env_value("bogus"), DisplayPreference::Adaptive);
+    assert_eq!(
+        DisplayPreference::from_env_value("always"),
+        DisplayPreference::Always
+    );
+    assert_eq!(
+        DisplayPreference::from_env_value("NEVER"),
+        DisplayPreference::Never
+    );
+    assert_eq!(
+        DisplayPreference::from_env_value("adaptive"),
+        DisplayPreference::Adaptive
+    );
+    assert_eq!(
+        DisplayPreference::from_env_value(""),
+        DisplayPreference::Adaptive
+    );
+    assert_eq!(
+        DisplayPreference::from_env_value("bogus"),
+        DisplayPreference::Adaptive
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -60,7 +75,10 @@ fn overlay_underlines_when_flagging() {
     let mut fb = blank_fb();
     p.overlay(&mut fb);
     assert_eq!(fb.cell_at(0, 0).unwrap().ch, 'h');
-    assert!(fb.cell_at(0, 0).unwrap().attr.under, "Always must underline");
+    assert!(
+        fb.cell_at(0, 0).unwrap().attr.under,
+        "Always must underline"
+    );
     assert_eq!(fb.cell_at(1, 0).unwrap().ch, 'i');
     assert!(fb.cell_at(1, 0).unwrap().attr.under);
     assert_eq!(fb.cur_x, 2);
@@ -214,7 +232,7 @@ fn host_row_bs_uses_frame_pending_not_instant_diverge() {
     // Host has "hello"; BS at col 1 predicts shifted tail with expiration.
     // With frames set so acked < exp, Confirm must not diverge.
     let mut p = always();
-    p.set_frames(5, 0); // sent=5, acked=0 → Pending
+    p.set_frames(5, 0, 0); // sent=5, acked=0 → Pending
     p.set_cursor(1, 0);
     let mut host = blank_fb();
     for (i, ch) in ['h', 'e', 'l', 'l', 'o'].into_iter().enumerate() {
@@ -229,7 +247,7 @@ fn host_row_bs_uses_frame_pending_not_instant_diverge() {
     p.confirm(&host);
     assert_eq!(p.pending_len(), n, "must stay Pending until frame acked");
     // Ack frames and apply shifted host
-    p.set_frames(5, 6);
+    p.set_frames(5, 6, 6);
     let mut shifted = blank_fb();
     for (i, ch) in ['e', 'l', 'l', 'o', ' '].into_iter().enumerate() {
         shifted.put_rune(i, 0, ch, Attr::default());
@@ -283,7 +301,10 @@ fn left_cell_attr_inherited_on_overlay() {
     p.keystroke(b"x", &fb);
     p.overlay(&mut fb);
     assert_eq!(fb.cell_at(1, 0).unwrap().ch, 'x');
-    assert!(fb.cell_at(1, 0).unwrap().attr.bold, "inherit bold from left");
+    assert!(
+        fb.cell_at(1, 0).unwrap().attr.bold,
+        "inherit bold from left"
+    );
     assert!(fb.cell_at(1, 0).unwrap().attr.under, "Always flagging");
 }
 
@@ -317,7 +338,7 @@ fn row_change_becomes_tentative() {
 #[test]
 fn host_line_insert_shifts_tail_under_pending() {
     let mut p = always();
-    p.set_frames(4, 0);
+    p.set_frames(4, 0, 0);
     let mut host = blank_fb();
     for (i, ch) in ['h', 'e', 'l', 'l', 'o'].into_iter().enumerate() {
         host.put_rune(i, 0, ch, Attr::default());
@@ -512,7 +533,7 @@ fn destructive_el_clears_pending_pipeline() {
 #[test]
 fn frame_ack_pending_stalls_confirm_until_acked() {
     let mut p = always();
-    p.set_frames(3, 0);
+    p.set_frames(3, 0, 0);
     p.set_cursor(0, 0);
     p.keystroke(b"a", &blank_fb());
     // expiration_sent = 4, acked = 0 → Pending
@@ -521,7 +542,7 @@ fn frame_ack_pending_stalls_confirm_until_acked() {
     fb.cur_x = 1;
     p.confirm(&fb);
     assert_eq!(p.pending_len(), 1, "must stay Pending while unacked");
-    p.set_frames(3, 4);
+    p.set_frames(3, 4, 4);
     p.confirm(&fb);
     assert_eq!(p.pending_len(), 0, "confirm after ack");
 }
@@ -553,8 +574,7 @@ fn become_tentative_hides_new_preds_until_proven() {
     // pending has b? drained. only c which is hidden
     // cursor may still move
     assert!(
-        view2.cell_at(2, 0).map(|c| c.ch).unwrap_or(' ') != 'c'
-            || p.pending_len() == 1,
+        view2.cell_at(2, 0).map(|c| c.ch).unwrap_or(' ') != 'c' || p.pending_len() == 1,
         "new-epoch c should be tentative/hidden"
     );
 }
@@ -655,7 +675,11 @@ fn fragmented_csi_assembles_across_chunks() {
     // Split ESC [
     p.keystroke(&[0x1b], &blank_fb());
     assert!(p.has_esc_buf_for_test(), "lone ESC must buffer");
-    assert_eq!(p.pending_len(), 1, "must not clear pending on incomplete ESC");
+    assert_eq!(
+        p.pending_len(),
+        1,
+        "must not clear pending on incomplete ESC"
+    );
     p.keystroke(b"[D", &blank_fb());
     assert_eq!(p.cur_x(), 0);
     assert_eq!(p.pending_len(), 1);
@@ -902,10 +926,7 @@ fn pipeline_demote_show_clears_overlay() {
     assert_eq!(pipe.predictor().pending_len(), 0);
     let _paint = pipe.set_srtt(Some(Duration::from_millis(5)));
     assert!(!pipe.predictor().should_show());
-    assert!(
-        !pipe.using_overlay_path(),
-        "demote must leave overlay path"
-    );
+    assert!(!pipe.using_overlay_path(), "demote must leave overlay path");
     let shown = pipe.last_shown().expect("last_shown after demote");
     for x in 0..10 {
         if let Some(c) = shown.cell_at(x, 0) {
@@ -934,7 +955,10 @@ fn pipeline_tick_expires_and_repaints_host_clean() {
     // Overlay gone: last_shown should revert toward host (space/empty at 0,0)
     let shown = pipe.last_shown().unwrap();
     assert_ne!(
-        (shown.cell_at(0, 0).unwrap().ch, shown.cell_at(0, 0).unwrap().attr.under),
+        (
+            shown.cell_at(0, 0).unwrap().ch,
+            shown.cell_at(0, 0).unwrap().attr.under
+        ),
         ('z', true),
         "expired prediction must not remain underlined z on last_shown"
     );
@@ -976,7 +1000,6 @@ fn pipeline_resize_full_redraw() {
     assert_eq!(pipe.host_fb().rows, 24);
 }
 
-
 // ---------------------------------------------------------------------------
 // Fidelity hardening (cursor_exp, unknown, overwrite BS, adaptive bg, structural)
 // ---------------------------------------------------------------------------
@@ -984,7 +1007,7 @@ fn pipeline_resize_full_redraw() {
 #[test]
 fn cursor_only_survives_confirm_until_frame_ack() {
     let mut p = always();
-    p.set_frames(3, 2);
+    p.set_frames(3, 2, 2);
     p.set_cursor(2, 0);
     p.keystroke(b"\x1b[C", &blank_fb()); // right arrow
     assert!(p.active());
@@ -998,7 +1021,7 @@ fn cursor_only_survives_confirm_until_frame_ack() {
     assert!(p.active(), "cursor pred Pending until ack");
     assert_eq!(p.cur_x(), 3);
     // Ack + host matches predicted cursor.
-    p.set_frames(3, 4);
+    p.set_frames(3, 4, 4);
     host.cur_x = 3;
     p.confirm(&host);
     assert!(!p.active());
@@ -1008,11 +1031,11 @@ fn cursor_only_survives_confirm_until_frame_ack() {
 #[test]
 fn cursor_only_resets_on_ack_mismatch() {
     let mut p = always();
-    p.set_frames(5, 5);
+    p.set_frames(5, 5, 5);
     p.set_cursor(1, 0);
     p.keystroke(b"\x1b[D", &blank_fb()); // left → col 0, exp=6
     assert_eq!(p.cur_x(), 0);
-    p.set_frames(5, 6); // acked past exp
+    p.set_frames(5, 6, 6); // acked past exp
     let mut host = blank_fb();
     host.cur_x = 4; // disagree
     host.cur_y = 0;
@@ -1030,8 +1053,15 @@ fn unknown_overlay_does_not_replace_glyph() {
     let mut fb = blank_fb();
     fb.put_rune(0, 0, 'H', Attr::default());
     p.overlay(&mut fb);
-    assert_eq!(fb.cell_at(0, 0).unwrap().ch, 'H', "unknown must not replace host");
-    assert!(fb.cell_at(0, 0).unwrap().attr.under, "flagging still underlines unknown");
+    assert_eq!(
+        fb.cell_at(0, 0).unwrap().ch,
+        'H',
+        "unknown must not replace host"
+    );
+    assert!(
+        fb.cell_at(0, 0).unwrap().attr.under,
+        "flagging still underlines unknown"
+    );
 }
 
 #[test]
@@ -1058,7 +1088,11 @@ fn adaptive_cold_builds_background_predictions() {
     assert!(!p.should_show());
     p.set_cursor(0, 0);
     p.keystroke(b"hi", &blank_fb());
-    assert_eq!(p.pending_len(), 2, "stock Adaptive predicts while not showing");
+    assert_eq!(
+        p.pending_len(),
+        2,
+        "stock Adaptive predicts while not showing"
+    );
     assert!(!p.should_show());
     // Warm up show
     p.set_srtt(Some(Duration::from_millis(100)));
@@ -1159,7 +1193,6 @@ fn kill_epoch_resyncs_cursor_to_host() {
     }
 }
 
-
 #[test]
 fn ss3_up_does_not_pollute_pending() {
     let mut p = always();
@@ -1168,7 +1201,11 @@ fn ss3_up_does_not_pollute_pending() {
     assert_eq!(p.pending_len(), 1);
     // ESC O A — SS3 up (not left/right)
     p.keystroke(b"\x1bOA", &blank_fb());
-    assert_eq!(p.pending_len(), 1, "SS3 non-C/D must not predict O/A as glyphs");
+    assert_eq!(
+        p.pending_len(),
+        1,
+        "SS3 non-C/D must not predict O/A as glyphs"
+    );
     assert_eq!(p.pending_char(0), Some('a'));
 }
 
@@ -1192,7 +1229,7 @@ fn pipeline_split_ich_resets_pending() {
 fn adaptive_demote_preserves_cursor_only_active() {
     let mut p = adaptive();
     p.set_srtt(Some(Duration::from_millis(100)));
-    p.set_frames(2, 2);
+    p.set_frames(2, 2, 2);
     p.set_cursor(2, 0);
     p.keystroke(b"\x1b[C", &blank_fb());
     assert!(p.active());
@@ -1220,7 +1257,6 @@ fn kill_epoch_resyncs_cursor_to_host_strict() {
     assert_eq!(p.cur_x(), 5);
     assert_eq!(p.cur_y(), 1);
 }
-
 
 // ---------------------------------------------------------------------------
 // Polish: Correct row rendition sync + keystroke UTF-8 carry
@@ -1430,10 +1466,7 @@ fn pipeline_keystroke_split_utf8_paints_once_complete() {
     let paint2 = pipe.on_keystroke(&[0xA9]);
     assert_eq!(pipe.predictor().pending_len(), 1);
     assert_eq!(pipe.predictor().pending_char(0), Some('é'));
-    assert!(
-        !paint2.is_empty(),
-        "completed UTF-8 must emit Diff paint"
-    );
+    assert!(!paint2.is_empty(), "completed UTF-8 must emit Diff paint");
 }
 
 #[test]
@@ -1465,4 +1498,57 @@ fn pipeline_correct_cascade_visible_in_last_shown() {
         shown.cell_at(1, 0).unwrap().attr.bold,
         "pipeline last_shown must show cascaded bold on remaining preds"
     );
+}
+
+// ---------------------------------------------------------------------------
+// late_ack (echo_ack) vs early transport ack
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pending_uses_late_ack_not_early_transport_ack() {
+    let mut p = always();
+    p.set_cursor(0, 0);
+    // sent=5; early transport ack advanced to 6, but late echo_ack still 0
+    p.set_frames(5, 6, 0);
+    p.keystroke(b"ab", &blank_fb());
+    assert_eq!(p.pending_len(), 2);
+    let mut host = blank_fb();
+    host.put_rune(0, 0, 'a', Attr::default());
+    host.put_rune(1, 0, 'b', Attr::default());
+    host.cur_x = 2;
+    // Content matches but late_ack < exp → must stay Pending
+    p.confirm(&host);
+    assert_eq!(
+        p.pending_len(),
+        2,
+        "stock Pending uses late_ack; early transport ack alone must not confirm"
+    );
+    // Now late_ack advances past expiration_sent (=6)
+    p.set_frames(5, 6, 6);
+    p.confirm(&host);
+    assert_eq!(p.pending_len(), 0, "late_ack must release Pending");
+}
+
+#[test]
+fn cursor_only_pending_waits_for_late_ack() {
+    let mut p = always();
+    p.set_frames(3, 3, 0);
+    p.set_cursor(2, 0);
+    p.keystroke(b"\x1b[C", &blank_fb());
+    assert_eq!(p.cur_x(), 3);
+    let mut host = blank_fb();
+    host.cur_x = 2; // host not yet moved
+    p.confirm(&host);
+    assert!(p.active(), "cursor Pending until late_ack");
+    assert_eq!(p.cur_x(), 3);
+    // early already 3, late still 0 — still pending
+    p.set_frames(3, 9, 0);
+    p.confirm(&host);
+    assert!(p.active());
+    // late catches up; host still wrong → reset
+    p.set_frames(3, 9, 4);
+    host.cur_x = 2;
+    p.confirm(&host);
+    assert!(!p.active());
+    assert_eq!(p.cur_x(), 2);
 }

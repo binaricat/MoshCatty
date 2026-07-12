@@ -112,6 +112,11 @@ impl Client {
         self.transport.acked_by_remote()
     }
 
+    /// Stock late_ack: max echo_ack_num from HostInstructions (prediction Pending).
+    pub fn echo_ack(&self) -> u64 {
+        self.terminal.echo_ack()
+    }
+
     /// Stock prediction uses ~SRTT/2 clamped to 20–250ms as `send_interval`.
     pub fn send_interval(&self) -> Option<std::time::Duration> {
         self.srtt().map(|d| {

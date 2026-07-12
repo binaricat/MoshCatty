@@ -98,11 +98,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // mosh-go / stock shape: HostBytes → client Framebuffer → Confirm →
     // Overlay → Diff(last_shown) → single PTY stream. Never dual-write raw
     // predicted glyphs beside HostBytes (Netcatty #2121).
-    let mut display = DisplayPipeline::new(
-        cols as usize,
-        rows as usize,
-        DisplayPreference::from_env(),
-    );
+    let mut display =
+        DisplayPipeline::new(cols as usize, rows as usize, DisplayPreference::from_env());
     let mut last_resize_check = Instant::now();
     let mut cur_cols = cols;
     let mut cur_rows = rows;
@@ -120,13 +117,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             stdout.write_all(&mode_paint)?;
             stdout.flush()?;
         }
-        // Stock prediction uses sent/acked frame watermarks for Pending.
-        display.set_frames(client.sent_num(), client.acked_by_remote());
+        // Stock prediction: sent/early-ack (transport) + late-ack (echo_ack).
+        display.set_frames(
+            client.sent_num(),
+            client.acked_by_remote(),
+            client.echo_ack(),
+        );
 
         let host_paint = client.poll()?;
         if !host_paint.is_empty() {
             // Refresh acks after poll (may have advanced).
-            display.set_frames(client.sent_num(), client.acked_by_remote());
+            display.set_frames(
+                client.sent_num(),
+                client.acked_by_remote(),
+                client.echo_ack(),
+            );
             let out = display.on_host_bytes(&host_paint);
             if !out.is_empty() {
                 stdout.write_all(&out)?;

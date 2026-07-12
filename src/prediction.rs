@@ -102,9 +102,11 @@ pub struct Predictor {
     flagging: bool,
     glitch_trigger: u32,
     esc_buf: Vec<u8>,
-    /// Stock local_frame_sent / local_frame_acked (SSP state numbers).
+    /// Stock local_frame_sent / local_frame_acked (SSP early ack = transport).
     local_frame_sent: u64,
     local_frame_acked: u64,
+    /// Stock `local_frame_late_acked` from HostInstruction.echo_ack_num.
+    local_frame_late_acked: u64,
     /// Cursor-only prediction expiry (stock ConditionalCursorMove).
     cursor_exp_sent: Option<u64>,
     last_quick_confirmation: Option<Instant>,
@@ -132,6 +134,7 @@ impl Predictor {
             esc_buf: Vec::new(),
             local_frame_sent: 0,
             local_frame_acked: 0,
+            local_frame_late_acked: 0,
             cursor_exp_sent: None,
             last_quick_confirmation: None,
             overwrite: std::env::var("MOSH_PREDICTION_OVERWRITE")
@@ -144,14 +147,33 @@ impl Predictor {
         self.preference
     }
 
-    /// Update SSP frame watermarks (stock set_local_frame_sent / acked).
-    pub fn set_frames(&mut self, sent: u64, acked: u64) {
+    /// Update SSP frame watermarks.
+    ///
+    /// - `sent` / `early_acked`: transport SSP state numbers
+    /// - `late_acked`: stock `echo_ack` from HostInstruction (Pending gate)
+    ///
+    /// Confirm Pending uses **late_acked** (stock `get_validity` ignores early_ack).
+    pub fn set_frames(&mut self, sent: u64, early_acked: u64, late_acked: u64) {
         if sent > self.local_frame_sent {
             self.local_frame_sent = sent;
         }
-        if acked > self.local_frame_acked {
-            self.local_frame_acked = acked;
+        if early_acked > self.local_frame_acked {
+            self.local_frame_acked = early_acked;
         }
+        if late_acked > self.local_frame_late_acked {
+            self.local_frame_late_acked = late_acked;
+        }
+    }
+
+    /// Convenience for tests: set sent + both acks to the same watermark.
+    #[cfg(test)]
+    pub fn set_frames_simple_for_test(&mut self, sent: u64, acked: u64) {
+        self.set_frames(sent, acked, acked);
+    }
+
+    /// Effective Pending watermark (stock late_ack).
+    fn late_ack(&self) -> u64 {
+        self.local_frame_late_acked
     }
 
     /// Stock hysteresis for show + flagging + glitch sampling.
@@ -344,7 +366,8 @@ impl Predictor {
         } else if self.overwrite {
             let orig = fb.cell_at(cx, cy).map(|c| c.ch).unwrap_or(' ');
             // Last-col overwrite is unknown (shell/emacs disagree).
-            self.pending.push(self.make_pred(ch, cx, cy, orig, at_last_col));
+            self.pending
+                .push(self.make_pred(ch, cx, cy, orig, at_last_col));
             if at_last_col {
                 self.cur_x = 0;
                 if self.cur_y + 1 < fb.rows {
@@ -413,18 +436,14 @@ impl Predictor {
             let c = bytes[j];
             if (b'0'..=b'9').contains(&c) {
                 saw_digit = true;
-                param = param
-                    .saturating_mul(10)
-                    .saturating_add(u32::from(c - b'0'));
+                param = param.saturating_mul(10).saturating_add(u32::from(c - b'0'));
                 j += 1;
                 continue;
             }
             if c == b';' {
                 // Extra params: skip to final (only first count used for C/D).
                 j += 1;
-                while j < bytes.len()
-                    && ((b'0'..=b'9').contains(&bytes[j]) || bytes[j] == b';')
-                {
+                while j < bytes.len() && ((b'0'..=b'9').contains(&bytes[j]) || bytes[j] == b';') {
                     j += 1;
                 }
                 continue;
@@ -693,7 +712,14 @@ impl Predictor {
         self.pending.sort_by(|a, b| (a.y, a.x).cmp(&(b.y, b.x)));
     }
 
-    fn make_pred(&self, ch: char, x: usize, y: usize, original_ch: char, unknown: bool) -> Prediction {
+    fn make_pred(
+        &self,
+        ch: char,
+        x: usize,
+        y: usize,
+        original_ch: char,
+        unknown: bool,
+    ) -> Prediction {
         Prediction {
             ch,
             x,
@@ -706,7 +732,6 @@ impl Predictor {
             overlay_attr: None,
         }
     }
-
 
     /// mosh-go ExpireStale + stock glitch sampling on oldest pending age.
     pub fn expire_stale(&mut self, now: Instant) {
@@ -725,14 +750,14 @@ impl Predictor {
 
         let cutoff = now.checked_sub(PREDICTION_TIMEOUT).unwrap_or(now);
         let sent = self.local_frame_sent;
-        let acked = self.local_frame_acked;
+        let late = self.late_ack();
         let before = self.pending.len();
         self.pending.retain(|p| {
             if p.at >= cutoff {
                 return true;
             }
-            // Keep frame-Pending preds until acked (stock late_ack / expiration).
-            if sent > 0 && acked < p.expiration_sent {
+            // Keep frame-Pending preds until late_ack (stock echo_ack).
+            if sent > 0 && late < p.expiration_sent {
                 return true;
             }
             false
@@ -795,14 +820,14 @@ impl Predictor {
             self.glitch_trigger = 0;
             // Cursor-only predictions (arrows / CR) must survive until frame ack.
             if let Some(exp) = self.cursor_exp_sent {
-                if self.local_frame_sent == 0 || self.local_frame_acked >= exp {
+                if self.local_frame_sent == 0 || self.late_ack() >= exp {
                     if fb.cur_x == self.cur_x && fb.cur_y == self.cur_y {
                         self.active = false;
                         self.cursor_exp_sent = None;
                         self.cur_x = fb.cur_x;
                         self.cur_y = fb.cur_y;
                     } else if self.local_frame_sent > 0 {
-                        // Host cursor disagrees after ack — stock IncorrectOrExpired.
+                        // Host cursor disagrees after late_ack — stock IncorrectOrExpired.
                         self.reset();
                         self.cur_x = fb.cur_x;
                         self.cur_y = fb.cur_y;
@@ -834,7 +859,7 @@ impl Predictor {
             // Frame not yet acked — stock Pending: stop, do not diverge.
             // When frame watermarks were never set (unit tests / early session),
             // skip Pending and allow content confirm.
-            if self.local_frame_sent > 0 && self.local_frame_acked < pred.expiration_sent {
+            if self.local_frame_sent > 0 && self.late_ack() < pred.expiration_sent {
                 break;
             }
             let pred_epoch = pred.epoch;
@@ -924,14 +949,14 @@ impl Predictor {
             self.glitch_trigger = 0;
             // Cursor-only: if expired and host disagrees, reset; if matches, clear active.
             if let Some(exp) = self.cursor_exp_sent {
-                if self.local_frame_sent == 0 || self.local_frame_acked >= exp {
+                if self.local_frame_sent == 0 || self.late_ack() >= exp {
                     if fb.cur_x == self.cur_x && fb.cur_y == self.cur_y {
                         self.active = false;
                         self.cursor_exp_sent = None;
                         self.cur_x = fb.cur_x;
                         self.cur_y = fb.cur_y;
                     } else if self.local_frame_sent > 0 {
-                        // Host cursor disagrees after ack — stock IncorrectOrExpired.
+                        // Host cursor disagrees after late_ack — stock IncorrectOrExpired.
                         self.reset();
                         self.cur_x = fb.cur_x;
                         self.cur_y = fb.cur_y;
@@ -1144,14 +1169,20 @@ impl DisplayPipeline {
         self.using_overlay_path
     }
 
-    /// Feed SSP sent/acked watermarks into the predictor.
-    pub fn set_frames(&mut self, sent: u64, acked: u64) {
-        self.predictor.set_frames(sent, acked);
+    /// Feed SSP sent / early-ack / late-ack (echo_ack) into the predictor.
+    pub fn set_frames(&mut self, sent: u64, early_acked: u64, late_acked: u64) {
+        self.predictor.set_frames(sent, early_acked, late_acked);
     }
 
     #[cfg(test)]
     pub fn set_frames_for_test(&mut self, sent: u64, acked: u64) {
-        self.set_frames(sent, acked);
+        // Tests without separate echo_ack: advance late with early.
+        self.set_frames(sent, acked, acked);
+    }
+
+    #[cfg(test)]
+    pub fn set_frames_late_for_test(&mut self, sent: u64, early: u64, late: u64) {
+        self.set_frames(sent, early, late);
     }
 
     /// Resize local model; returns a full redraw for the PTY when size changes.
@@ -1161,7 +1192,8 @@ impl DisplayPipeline {
         }
         self.host_fb.resize(cols, rows);
         self.predictor.reset();
-        self.predictor.set_cursor(self.host_fb.cur_x, self.host_fb.cur_y);
+        self.predictor
+            .set_cursor(self.host_fb.cur_x, self.host_fb.cur_y);
         self.pen = crate::ansi_apply::AnsiPen::default();
         // Force full redraw baseline (stock new_frame on size mismatch).
         let paint = self.host_fb.diff(None);

@@ -17,6 +17,8 @@ pub struct TerminalView {
     paint: Vec<u8>,
     cols: u16,
     rows: u16,
+    /// Max HostInstruction.echo_ack_num seen (stock late_ack for prediction).
+    echo_ack: u64,
 }
 
 impl TerminalView {
@@ -25,6 +27,7 @@ impl TerminalView {
             paint: Vec::new(),
             cols,
             rows,
+            echo_ack: 0,
         }
     }
 
@@ -40,6 +43,11 @@ impl TerminalView {
     /// returned chunk; history is for tests / diagnostics).
     const PAINT_HISTORY_CAP: usize = 64 * 1024;
 
+    /// Highest echo_ack from the server (stock `local_frame_late_acked`).
+    pub fn echo_ack(&self) -> u64 {
+        self.echo_ack
+    }
+
     /// Apply a HostMessage diff (list of host instructions).
     /// Returns the bytes that should be written to the local terminal.
     pub fn apply_host_diff(&mut self, diff: &[u8]) -> Vec<u8> {
@@ -52,6 +60,13 @@ impl TerminalView {
             if hi.width > 0 && hi.height > 0 {
                 self.cols = hi.width as u16;
                 self.rows = hi.height as u16;
+            }
+            // Stock stmclient: late_ack comes from EchoAck / echo_ack_num.
+            if hi.echo_ack_num >= 0 {
+                let n = hi.echo_ack_num as u64;
+                if n > self.echo_ack {
+                    self.echo_ack = n;
+                }
             }
             if !hi.hoststring.is_empty() {
                 out.extend_from_slice(&hi.hoststring);
@@ -235,5 +250,34 @@ mod tests {
         }]);
         let painted = view.apply_host_diff(&msg);
         assert_eq!(std::str::from_utf8(&painted).unwrap(), "你好世界");
+    }
+
+    #[test]
+    fn echo_ack_tracks_max_from_host_instructions() {
+        let mut view = TerminalView::new(80, 24);
+        assert_eq!(view.echo_ack(), 0);
+        let msg = HostInstruction::encode_message(&[
+            HostInstruction {
+                hoststring: b"a".to_vec(),
+                width: 80,
+                height: 24,
+                echo_ack_num: 3,
+            },
+            HostInstruction {
+                hoststring: b"b".to_vec(),
+                width: 0,
+                height: 0,
+                echo_ack_num: 5,
+            },
+            HostInstruction {
+                hoststring: Vec::new(),
+                width: 0,
+                height: 0,
+                echo_ack_num: 4, // lower — must not regress
+            },
+        ]);
+        let painted = view.apply_host_diff(&msg);
+        assert_eq!(painted, b"ab");
+        assert_eq!(view.echo_ack(), 5);
     }
 }

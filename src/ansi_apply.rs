@@ -46,6 +46,7 @@ pub fn apply_ansi_with_pen(fb: &mut Framebuffer, pen: &mut AnsiPen, data: &[u8])
         }
         if b == b'\r' {
             fb.cur_x = 0;
+            fb.next_print_will_wrap = false;
             i += 1;
             continue;
         }
@@ -57,6 +58,7 @@ pub fn apply_ansi_with_pen(fb: &mut Framebuffer, pen: &mut AnsiPen, data: &[u8])
             } else {
                 fb.cur_y += 1;
             }
+            fb.next_print_will_wrap = false;
             i += 1;
             continue;
         }
@@ -88,6 +90,18 @@ pub fn apply_ansi_with_pen(fb: &mut Framebuffer, pen: &mut AnsiPen, data: &[u8])
                 if ch == '\0' {
                     continue;
                 }
+                // Stock next_print_will_wrap: wrap *before* placing the next glyph.
+                if fb.next_print_will_wrap {
+                    fb.next_print_will_wrap = false;
+                    if fb.cur_y + 1 < fb.rows {
+                        fb.cur_y += 1;
+                        fb.cur_x = 0;
+                    } else {
+                        scroll_up(fb, 1);
+                        fb.cur_y = fb.rows.saturating_sub(1);
+                        fb.cur_x = 0;
+                    }
+                }
                 let x = fb.cur_x;
                 let y = fb.cur_y;
                 if x < fb.cols && y < fb.rows {
@@ -96,18 +110,13 @@ pub fn apply_ansi_with_pen(fb: &mut Framebuffer, pen: &mut AnsiPen, data: &[u8])
                         // Combining / ZW: do not advance cursor.
                         continue;
                     }
-                    // DECAWM-style wrap (host model for Confirm fidelity).
+                    // Stock DECAWM: stay on last col and set wrap flag (no immediate wrap).
                     if x + w >= fb.cols {
-                        if y + 1 < fb.rows {
-                            fb.cur_y = y + 1;
-                            fb.cur_x = 0;
-                        } else {
-                            scroll_up(fb, 1);
-                            fb.cur_y = fb.rows.saturating_sub(1);
-                            fb.cur_x = 0;
-                        }
+                        fb.cur_x = fb.cols.saturating_sub(1);
+                        fb.next_print_will_wrap = true;
                     } else {
                         fb.cur_x = x + w;
+                        fb.next_print_will_wrap = false;
                     }
                 }
             }
@@ -168,7 +177,12 @@ fn decode_utf8_at(data: &[u8], i: usize) -> Utf8Decode {
     }
 }
 
-fn consume_escape(fb: &mut Framebuffer, pen: &mut AnsiPen, data: &[u8], start: usize) -> EscapeConsume {
+fn consume_escape(
+    fb: &mut Framebuffer,
+    pen: &mut AnsiPen,
+    data: &[u8],
+    start: usize,
+) -> EscapeConsume {
     let mut i = start + 1;
     if i >= data.len() {
         return EscapeConsume::NeedMore(start);
@@ -258,32 +272,39 @@ fn apply_csi(fb: &mut Framebuffer, pen: &mut AnsiPen, params: &[u8], final_byte:
             let col = nums.get(1).copied().unwrap_or(1).max(1) as usize;
             fb.cur_y = (row - 1).min(fb.rows.saturating_sub(1));
             fb.cur_x = (col - 1).min(fb.cols.saturating_sub(1));
+            fb.next_print_will_wrap = false;
         }
         b'A' => {
             let n = nums.first().copied().unwrap_or(1).max(1) as usize;
             fb.cur_y = fb.cur_y.saturating_sub(n);
+            fb.next_print_will_wrap = false;
         }
         b'B' => {
             let n = nums.first().copied().unwrap_or(1).max(1) as usize;
             fb.cur_y = (fb.cur_y + n).min(fb.rows.saturating_sub(1));
+            fb.next_print_will_wrap = false;
         }
         b'C' => {
             let n = nums.first().copied().unwrap_or(1).max(1) as usize;
             fb.cur_x = (fb.cur_x + n).min(fb.cols.saturating_sub(1));
+            fb.next_print_will_wrap = false;
         }
         b'D' => {
             let n = nums.first().copied().unwrap_or(1).max(1) as usize;
             fb.cur_x = fb.cur_x.saturating_sub(n);
+            fb.next_print_will_wrap = false;
         }
         b'G' => {
             // CHA — column absolute 1-indexed
             let col = nums.first().copied().unwrap_or(1).max(1) as usize;
             fb.cur_x = (col - 1).min(fb.cols.saturating_sub(1));
+            fb.next_print_will_wrap = false;
         }
         b'd' => {
             // VPA
             let row = nums.first().copied().unwrap_or(1).max(1) as usize;
             fb.cur_y = (row - 1).min(fb.rows.saturating_sub(1));
+            fb.next_print_will_wrap = false;
         }
         b'J' => {
             // ED
@@ -428,10 +449,9 @@ fn insert_lines(fb: &mut Framebuffer, n: usize) {
     // Shift rows down
     for row in (y..fb.rows - n).rev() {
         for col in 0..cols {
-            if let (Some(src), Some(dst)) = (
-                fb.cell_at(col, row).copied(),
-                fb.cell_at_mut(col, row + n),
-            ) {
+            if let (Some(src), Some(dst)) =
+                (fb.cell_at(col, row).copied(), fb.cell_at_mut(col, row + n))
+            {
                 *dst = src;
             }
         }
@@ -454,10 +474,9 @@ fn delete_lines(fb: &mut Framebuffer, n: usize) {
     let cols = fb.cols;
     for row in y..fb.rows - n {
         for col in 0..cols {
-            if let (Some(src), Some(dst)) = (
-                fb.cell_at(col, row + n).copied(),
-                fb.cell_at_mut(col, row),
-            ) {
+            if let (Some(src), Some(dst)) =
+                (fb.cell_at(col, row + n).copied(), fb.cell_at_mut(col, row))
+            {
                 *dst = src;
             }
         }
@@ -544,11 +563,8 @@ fn apply_sgr(pen: &mut AnsiPen, nums: &[u32]) {
                     pen.attr.fg = Color::index(nums[i + 2]);
                     i += 2;
                 } else if i + 1 < nums.len() && nums[i + 1] == 2 && i + 4 < nums.len() {
-                    pen.attr.fg = Color::rgb(
-                        nums[i + 2] as u8,
-                        nums[i + 3] as u8,
-                        nums[i + 4] as u8,
-                    );
+                    pen.attr.fg =
+                        Color::rgb(nums[i + 2] as u8, nums[i + 3] as u8, nums[i + 4] as u8);
                     i += 4;
                 }
             }
@@ -557,11 +573,8 @@ fn apply_sgr(pen: &mut AnsiPen, nums: &[u32]) {
                     pen.attr.bg = Color::index(nums[i + 2]);
                     i += 2;
                 } else if i + 1 < nums.len() && nums[i + 1] == 2 && i + 4 < nums.len() {
-                    pen.attr.bg = Color::rgb(
-                        nums[i + 2] as u8,
-                        nums[i + 3] as u8,
-                        nums[i + 4] as u8,
-                    );
+                    pen.attr.bg =
+                        Color::rgb(nums[i + 2] as u8, nums[i + 3] as u8, nums[i + 4] as u8);
                     i += 4;
                 }
             }
@@ -649,12 +662,29 @@ mod tests {
     }
 
     #[test]
-    fn printable_wraps_to_next_row() {
+    fn printable_defers_wrap_until_next_char() {
         let mut fb = Framebuffer::new(4, 3);
-        apply_ansi(&mut fb, b"\x1b[Habcd"); // fills row 0
-        assert_eq!(fb.cur_x, 0);
-        assert_eq!(fb.cur_y, 1);
+        apply_ansi(&mut fb, b"\x1b[Habcd"); // fills row 0 cols 0..3
+                                            // Stock: after last col, stay at col 3 with wrap flag set.
+        assert_eq!(fb.cur_x, 3);
+        assert_eq!(fb.cur_y, 0);
+        assert!(fb.next_print_will_wrap);
+        assert_eq!(fb.cell_at(3, 0).unwrap().ch, 'd');
         apply_ansi(&mut fb, b"X");
+        assert_eq!(fb.cur_y, 1);
+        assert_eq!(fb.cur_x, 1);
         assert_eq!(fb.cell_at(0, 1).unwrap().ch, 'X');
+        assert!(!fb.next_print_will_wrap);
+    }
+
+    #[test]
+    fn cup_clears_wrap_flag() {
+        let mut fb = Framebuffer::new(4, 3);
+        apply_ansi(&mut fb, b"\x1b[Habcd");
+        assert!(fb.next_print_will_wrap);
+        apply_ansi(&mut fb, b"\x1b[1;1H");
+        assert!(!fb.next_print_will_wrap);
+        assert_eq!(fb.cur_x, 0);
+        assert_eq!(fb.cur_y, 0);
     }
 }

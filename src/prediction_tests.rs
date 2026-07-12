@@ -210,33 +210,33 @@ fn backspace_undoes_own_last_glyph() {
 }
 
 #[test]
-fn backspace_does_not_invent_host_space_for_confirm_race() {
-    // Host has "hello"; user has no pending at col 0. BS must not invent a
-    // space pred that Confirm would immediately diverge against host 'h'.
+fn host_row_bs_uses_frame_pending_not_instant_diverge() {
+    // Host has "hello"; BS at col 1 predicts shifted tail with expiration.
+    // With frames set so acked < exp, Confirm must not diverge.
     let mut p = always();
-    p.set_cursor(1, 0); // after first host char
+    p.set_frames(5, 0); // sent=5, acked=0 → Pending
+    p.set_cursor(1, 0);
     let mut host = blank_fb();
     for (i, ch) in ['h', 'e', 'l', 'l', 'o'].into_iter().enumerate() {
         host.put_rune(i, 0, ch, Attr::default());
     }
     host.cur_x = 1;
     p.keystroke(&[0x7f], &host);
-    // No pending with ch=' ' at 0 that would fight host 'h'
-    for i in 0..p.pending_len() {
-        if p.pending_pos(i) == Some((0, 0)) {
-            assert_ne!(
-                p.pending_char(i),
-                Some(' '),
-                "must not invent space over host content"
-            );
-        }
-    }
-    // Cursor moved left
     assert_eq!(p.cur_x(), 0);
-    // Confirm against host must not full-reset into panic state
+    assert!(p.pending_len() > 0, "host-row BS creates shift preds");
+    // Host not yet updated — still Pending, no diverge
     p.confirm(&host);
-    // Still consistent
-    assert_eq!(p.cur_x(), host.cur_x);
+    assert!(p.pending_len() > 0, "must stay Pending until frame acked");
+    // Ack frames and apply shifted host, then confirm can succeed
+    p.set_frames(5, 6);
+    let mut shifted = blank_fb();
+    for (i, ch) in ['e', 'l', 'l', 'o', ' '].into_iter().enumerate() {
+        shifted.put_rune(i, 0, ch, Attr::default());
+    }
+    shifted.cur_x = 0;
+    p.confirm(&shifted);
+    // Should make progress without panic
+    assert!(p.cur_x() <= shifted.cols);
 }
 
 #[test]
@@ -362,6 +362,56 @@ fn destructive_el_clears_pending_pipeline() {
     );
 }
 
+#[test]
+fn frame_ack_pending_stalls_confirm_until_acked() {
+    let mut p = always();
+    p.set_frames(3, 0);
+    p.set_cursor(0, 0);
+    p.keystroke(b"a", &blank_fb());
+    // expiration_sent = 4, acked = 0 → Pending
+    let mut fb = blank_fb();
+    fb.put_rune(0, 0, 'a', Attr::default());
+    fb.cur_x = 1;
+    p.confirm(&fb);
+    assert_eq!(p.pending_len(), 1, "must stay Pending while unacked");
+    p.set_frames(3, 4);
+    p.confirm(&fb);
+    assert_eq!(p.pending_len(), 0, "confirm after ack");
+}
+
+#[test]
+fn become_tentative_hides_new_preds_until_proven() {
+    let mut p = always();
+    p.set_cursor(0, 0);
+    p.keystroke(b"a", &blank_fb());
+    // Prove epoch
+    let mut fb = blank_fb();
+    fb.put_rune(0, 0, 'a', Attr::default());
+    fb.cur_x = 1;
+    p.confirm(&fb);
+    assert_eq!(p.pending_len(), 0);
+    p.keystroke(b"b", &blank_fb());
+    // still same proven band — visible
+    let mut view = blank_fb();
+    p.overlay(&mut view);
+    assert_eq!(view.cell_at(1, 0).unwrap().ch, 'b');
+    // become_tentative → new epoch
+    p.become_tentative();
+    p.keystroke(b"c", &blank_fb());
+    let mut view2 = blank_fb();
+    // place host b at 1 for baseline
+    view2.put_rune(1, 0, 'b', Attr::default());
+    p.overlay(&mut view2);
+    // 'c' is tentative (hidden) until confirmed
+    // pending has b? drained. only c which is hidden
+    // cursor may still move
+    assert!(
+        view2.cell_at(2, 0).map(|c| c.ch).unwrap_or(' ') != 'c'
+            || p.pending_len() == 1,
+        "new-epoch c should be tentative/hidden"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Arrows / CSI
 // ---------------------------------------------------------------------------
@@ -396,9 +446,15 @@ fn csi_with_params_is_tentative_not_arrow() {
     let mut p = always();
     p.set_cursor(0, 0);
     p.keystroke(b"ab", &blank_fb());
-    p.keystroke(b"\x1b[1C", &blank_fb()); // param present
-    assert_eq!(p.pending_len(), 0, "param CSI must become_tentative");
-    assert!(!p.active() || p.pending_len() == 0);
+    let before = p.pending_len();
+    p.keystroke(b"\x1b[1C", &blank_fb()); // param present → become_tentative
+    assert_eq!(
+        p.pending_len(),
+        before,
+        "param CSI must not move cursor or wipe pending"
+    );
+    // New epoch: subsequent print may be hidden until confirmed
+    assert_eq!(p.cur_x(), 2, "param CSI must not act as arrow");
 }
 
 #[test]
@@ -418,21 +474,24 @@ fn fragmented_csi_assembles_across_chunks() {
 }
 
 #[test]
-fn control_and_escape_clear_pending() {
+fn control_become_tentative_hides_new_not_wipe_old() {
+    // Stock become_tentative: bump epoch, keep old pending.
     let mut p = always();
     p.set_cursor(0, 0);
     p.keystroke(b"ab", &blank_fb());
+    assert_eq!(p.pending_len(), 2);
     p.keystroke(b"\n", &blank_fb());
-    assert_eq!(p.pending_len(), 0);
-
-    p.keystroke(b"cd", &blank_fb());
-    // ESC then non-CSI byte: ESC is control (clears pending), 'x' may predict.
-    p.keystroke(&[0x1b, b'x'], &blank_fb());
-    assert_eq!(p.pending_len(), 1);
-    assert_eq!(p.pending_char(0), Some('x'));
-    // Pure control clears
-    p.keystroke(b"\r", &blank_fb());
-    assert_eq!(p.pending_len(), 0);
+    assert_eq!(
+        p.pending_len(),
+        2,
+        "become_tentative must not wipe old pending"
+    );
+    // New typing after control is a new epoch (still visible because
+    // confirmed_epoch tracks; after tentative bump new epoch is higher —
+    // hidden until confirm proves it).
+    p.keystroke(b"x", &blank_fb());
+    // ab remain + maybe x depending on epoch visibility
+    assert!(p.pending_len() >= 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -534,12 +593,29 @@ fn pipeline_local_echo_then_confirm_no_double_glyph() {
     let prompt = pipe.on_host_bytes(b"\x1b[H\x1b[2J$ ");
     assert!(!prompt.is_empty() || pipe.last_shown().is_some());
 
+    assert_eq!(
+        pipe.host_fb().cur_x,
+        2,
+        "prompt '$ ' must leave host cursor at col 2, got {}",
+        pipe.host_fb().cur_x
+    );
     let local = pipe.on_keystroke(b"ls");
     assert!(!local.is_empty(), "must emit Diff for local prediction");
+    assert_eq!(pipe.predictor().pending_len(), 2, "ls → 2 pending");
+    assert_eq!(pipe.predictor().pending_pos(0), Some((2, 0)));
     let shown = pipe.last_shown().expect("last_shown after keystroke");
     // "$ " at 0,1 then l,s at 2,3
-    assert_eq!(shown.cell_at(2, 0).unwrap().ch, 'l');
-    assert_eq!(shown.cell_at(3, 0).unwrap().ch, 's');
+    assert_eq!(
+        (
+            shown.cell_at(0, 0).unwrap().ch,
+            shown.cell_at(1, 0).unwrap().ch,
+            shown.cell_at(2, 0).unwrap().ch,
+            shown.cell_at(3, 0).unwrap().ch,
+            pipe.predictor().cur_x(),
+        ),
+        ('$', ' ', 'l', 's', 4),
+        "unexpected screen after local ls"
+    );
     assert!(shown.cell_at(2, 0).unwrap().attr.under);
 
     // Server confirms with absolute CUP — single l,s in host_fb

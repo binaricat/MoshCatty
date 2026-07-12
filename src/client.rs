@@ -103,6 +103,15 @@ impl Client {
         self.transport.srtt()
     }
 
+    /// SSP state numbers for stock-style prediction frame expiry.
+    pub fn sent_num(&self) -> u64 {
+        self.transport.sent_num()
+    }
+
+    pub fn acked_by_remote(&self) -> u64 {
+        self.transport.acked_by_remote()
+    }
+
     /// Poll network + flush pending ticks. Returns newly painted local bytes.
     pub fn poll(&mut self) -> Result<Vec<u8>> {
         if self.dead {

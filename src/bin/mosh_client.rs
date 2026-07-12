@@ -120,9 +120,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             stdout.write_all(&mode_paint)?;
             stdout.flush()?;
         }
+        // Stock prediction uses sent/acked frame watermarks for Pending.
+        display.set_frames(client.sent_num(), client.acked_by_remote());
 
         let host_paint = client.poll()?;
         if !host_paint.is_empty() {
+            // Refresh acks after poll (may have advanced).
+            display.set_frames(client.sent_num(), client.acked_by_remote());
             let out = display.on_host_bytes(&host_paint);
             if !out.is_empty() {
                 stdout.write_all(&out)?;

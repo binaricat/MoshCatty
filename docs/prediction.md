@@ -28,14 +28,16 @@ Never dual-write raw predicted glyphs beside HostBytes.
 |---------|-----------|---------|-----------|
 | Model | Framebuffer | Framebuffer | Framebuffer |
 | Paint | new_frame single stream | Diff | Diff |
-| Confirm | cull + epochs | Confirm(fb) | Confirm(fb) |
-| Printable | insert + advance | pending (x,y) | pending (x,y) |
-| Backspace | row shift / overwrite | **Reset all** | **undo + row shift pending** (stock-ish) |
+| Confirm | cull + epochs | Confirm(fb) | Confirm + frame Pending |
+| Printable | insert + advance | pending (x,y) | pending + mid-line shift |
+| Backspace | row shift / overwrite | **Reset all** | undo / shift pending / host-row insert BS |
 | Left/right | CSI C/D | none | CSI C/D + SS3 |
-| Other CSI/control | become_tentative | Reset | become_tentative |
-| Show adaptive | 30/20 ms + !active | n/a | 30/20 ms + !active |
+| Other CSI/control | become_tentative | Reset | become_tentative (keep pending) |
+| Tentative epochs | hide until proven | n/a | hide epoch > confirmed |
+| Frame expiry | late_ack vs exp frame | 500ms wall | acked vs expiration_sent + 15s backup |
+| Show adaptive | 30/20 ms + !active | n/a | 30/20 ms + pending hold |
 | Underline | flagging 80/50 ms | always | flagging 80/50 ms |
-| Glitch | 250ms show / 5s flag | 500ms expire | both |
+| Glitch | 250ms show / 5s flag | 500ms expire | both (no latch after empty) |
 | Wide glyph | tentative | treat as print | tentative (width≠1) |
 | Last column | tentative | n/a | tentative |
 | Bulk paste | reset >100 | always | reset >100 |

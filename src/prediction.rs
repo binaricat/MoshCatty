@@ -4,10 +4,15 @@
 //! pending `(rune, x, y)`, Confirm, Overlay, single Diff paint path.
 //!
 //! Stock extras (mobile-shell/mosh `terminaloverlay.cc`) for Termius-like feel:
-//! - Backspace undoes own predictions / shifts pending on the row (not full Reset)
+//! - Backspace undoes own predictions / shifts pending; host-row insert BS
+//!   when safe under frame-ack Pending semantics
 //! - Left/right arrow cursor prediction (CSI C/D, SS3)
 //! - Underline **flagging** hysteresis (80/50 ms), separate from show
 //! - Glitch triggers: long-pending preds force show / underline
+//! - **True tentative epochs**: become_tentative bumps epoch without wipe;
+//!   overlay hides preds with epoch > confirmed_epoch
+//! - **Frame-ack expiry**: preds stay Pending until local_frame_acked reaches
+//!   expiration_sent (stock late_ack vs expiration_frame)
 //!
 //! Never dual-write raw glyphs beside HostBytes.
 
@@ -66,28 +71,33 @@ struct Prediction {
     ch: char,
     x: usize,
     y: usize,
+    /// Stock `tentative_until_epoch`.
     epoch: u64,
     at: Instant,
+    /// Stock `expiration_frame` proxy: Pending while acked < this sent watermark.
+    expiration_sent: u64,
 }
 
-/// mosh-go style predictor + stock flagging / BS / arrows.
+/// mosh-go pending list + stock tentative / frame-ack / flagging / BS / arrows.
 #[derive(Debug)]
 pub struct Predictor {
     pending: Vec<Prediction>,
     cur_x: usize,
     cur_y: usize,
-    epoch: u64,
+    /// Stock `prediction_epoch` — new preds get this as tentative_until.
+    prediction_epoch: u64,
+    /// Stock `confirmed_epoch` — preds with epoch > this are hidden (tentative).
+    confirmed_epoch: u64,
     active: bool,
     confirmed: usize,
     preference: DisplayPreference,
-    /// Whether adaptive/always should overlay right now.
     show: bool,
-    /// Stock `flagging`: underline predicted cells when RTT is high.
     flagging: bool,
-    /// Stock glitch_trigger: force show/underline when preds hang.
     glitch_trigger: u32,
-    /// Partial CSI/SS3 assembly across keystroke chunks (stock keeps a parser).
     esc_buf: Vec<u8>,
+    /// Stock local_frame_sent / local_frame_acked (SSP state numbers).
+    local_frame_sent: u64,
+    local_frame_acked: u64,
 }
 
 impl Predictor {
@@ -96,7 +106,11 @@ impl Predictor {
             pending: Vec::new(),
             cur_x: 0,
             cur_y: 0,
-            epoch: 0,
+            // Start equal so the first keystrokes of a session are visible
+            // (stock starts 1/0 which hides until first prove; Termius-like
+            // UX prefers immediate echo — we still bump on become_tentative).
+            prediction_epoch: 1,
+            confirmed_epoch: 1,
             active: false,
             confirmed: 0,
             preference,
@@ -104,11 +118,23 @@ impl Predictor {
             flagging: matches!(preference, DisplayPreference::Always),
             glitch_trigger: 0,
             esc_buf: Vec::new(),
+            local_frame_sent: 0,
+            local_frame_acked: 0,
         }
     }
 
     pub fn preference(&self) -> DisplayPreference {
         self.preference
+    }
+
+    /// Update SSP frame watermarks (stock set_local_frame_sent / acked).
+    pub fn set_frames(&mut self, sent: u64, acked: u64) {
+        if sent > self.local_frame_sent {
+            self.local_frame_sent = sent;
+        }
+        if acked > self.local_frame_acked {
+            self.local_frame_acked = acked;
+        }
     }
 
     /// Stock hysteresis for show + flagging + glitch sampling.
@@ -236,7 +262,7 @@ impl Predictor {
                 continue;
             }
             if ch == '\u{08}' || ch == '\u{7f}' {
-                self.predict_backspace();
+                self.predict_backspace(fb);
                 continue;
             }
             if (ch as u32) < 0x20 {
@@ -256,7 +282,7 @@ impl Predictor {
                 let cx = self.cur_x;
                 let cy = self.cur_y;
                 for p in &mut self.pending {
-                    if p.epoch == self.epoch && p.y == cy && p.x >= cx {
+                    if p.epoch == self.prediction_epoch && p.y == cy && p.x >= cx {
                         p.x = p.x.saturating_add(1);
                     }
                 }
@@ -264,8 +290,9 @@ impl Predictor {
                     ch,
                     x: cx,
                     y: cy,
-                    epoch: self.epoch,
+                    epoch: self.prediction_epoch,
                     at: Instant::now(),
+                    expiration_sent: self.local_frame_sent.saturating_add(1),
                 });
                 self.cur_x = cx.saturating_add(1);
                 self.active = true;
@@ -351,26 +378,27 @@ impl Predictor {
         }
     }
 
-    /// Undo own last pending glyph, or shift own pending on the row.
-    /// Does not invent host-cell spaces (those race Confirm).
-    fn predict_backspace(&mut self) {
+    /// Undo own last pending glyph, shift own pending, or host-row insert BS.
+    /// Host-row shifts use frame-ack Pending so Confirm will not diverge early.
+    fn predict_backspace(&mut self, fb: &Framebuffer) {
         if self.cur_x == 0 {
             return;
         }
         let cx = self.cur_x - 1;
         let cy = self.cur_y;
         if let Some(last) = self.pending.last() {
-            if last.epoch == self.epoch && last.x == cx && last.y == cy {
+            if last.epoch == self.prediction_epoch && last.x == cx && last.y == cy {
                 self.pending.pop();
                 self.cur_x = cx;
                 self.active = true;
                 return;
             }
         }
-        let mut next = Vec::with_capacity(self.pending.len());
-        let mut touched = false;
+        // Shift own pending on this row (insert BS among local preds).
+        let mut next = Vec::with_capacity(self.pending.len().max(fb.cols));
+        let mut had_own = false;
         for p in self.pending.drain(..) {
-            if p.epoch != self.epoch || p.y != cy {
+            if p.y != cy {
                 next.push(p);
                 continue;
             }
@@ -378,31 +406,73 @@ impl Predictor {
                 next.push(p);
             } else if p.x > cx {
                 next.push(Prediction { x: p.x - 1, ..p });
-                touched = true;
+                had_own = true;
             } else {
-                touched = true;
+                had_own = true; // deleted at cx
             }
         }
-        self.pending = next;
         self.cur_x = cx;
-        let _ = touched;
-        // Always move glass cursor on BS (including over host-echoed text).
+        if had_own {
+            self.pending = next;
+            self.active = true;
+            return;
+        }
+        // Host-row insert BS: predict shifted host tail (stock for-loop).
+        // Keep non-row pending from `next` (other rows).
+        self.pending = next;
+        let exp = self.local_frame_sent.saturating_add(1);
+        let ep = self.prediction_epoch;
+        let now = Instant::now();
+        for x in cx..fb.cols.saturating_sub(1) {
+            let src = fb.cell_at(x + 1, cy);
+            let ch = src.map(|c| if c.ch == '\0' { ' ' } else { c.ch }).unwrap_or(' ');
+            self.pending.push(Prediction {
+                ch,
+                x,
+                y: cy,
+                epoch: ep,
+                at: now,
+                expiration_sent: exp,
+            });
+        }
+        if fb.cols > 0 {
+            self.pending.push(Prediction {
+                ch: ' ',
+                x: fb.cols - 1,
+                y: cy,
+                epoch: ep,
+                at: now,
+                expiration_sent: exp,
+            });
+        }
         self.active = true;
     }
 
-    /// Stock `become_tentative`: bump epoch so old pending is ignored; keep
-    /// cursor. New predictions start a fresh confidence band.
+    /// Stock become_tentative: bump prediction_epoch only.
+    /// Existing pending stay; those with epoch > confirmed_epoch are hidden.
     pub fn become_tentative(&mut self) {
-        self.epoch = self.epoch.wrapping_add(1);
-        self.pending.clear();
-        self.active = false;
-        self.confirmed = 0;
+        self.prediction_epoch = self.prediction_epoch.wrapping_add(1);
     }
 
-    /// Full reset (resize, demote, huge paste).
+    /// Kill all pending in a failed tentative epoch (stock kill_epoch).
+    fn kill_epoch(&mut self, epoch: u64) {
+        self.pending.retain(|p| p.epoch != epoch);
+        if self.prediction_epoch == epoch {
+            self.prediction_epoch = self.prediction_epoch.wrapping_add(1);
+        }
+        if self.pending.is_empty() {
+            self.active = false;
+            self.glitch_trigger = 0;
+        }
+    }
+
+    /// Full reset (resize, demote, huge paste, screen clear).
     pub fn reset(&mut self) {
         self.pending.clear();
-        self.epoch = self.epoch.wrapping_add(1);
+        self.prediction_epoch = self.prediction_epoch.wrapping_add(1);
+        // Re-align confidence so typing after reset is immediately visible
+        // (unlike become_tentative, which intentionally re-proves).
+        self.confirmed_epoch = self.prediction_epoch;
         self.active = false;
         self.confirmed = 0;
         self.glitch_trigger = 0;
@@ -468,10 +538,11 @@ impl Predictor {
         !self.esc_buf.is_empty()
     }
 
-    /// mosh-go `Confirm` + stock quick-confirm glitch repair.
+    /// Confirm against host FB with stock Pending (frame-ack) semantics.
     pub fn confirm(&mut self, fb: &Framebuffer) {
         if self.pending.is_empty() {
             self.active = false;
+            self.glitch_trigger = 0;
             self.cur_x = fb.cur_x;
             self.cur_y = fb.cur_y;
             return;
@@ -486,28 +557,41 @@ impl Predictor {
         let mut quick = false;
         while confirmed < self.pending.len() {
             let pred = &self.pending[confirmed];
-            if pred.epoch != self.epoch {
-                confirmed += 1;
-                continue;
+            // Frame not yet acked — stock Pending: stop, do not diverge.
+            // When frame watermarks were never set (unit tests / early session),
+            // skip Pending and allow content confirm.
+            if self.local_frame_sent > 0 && self.local_frame_acked < pred.expiration_sent {
+                break;
             }
             let Some(cell) = fb.cell_at(pred.x, pred.y) else {
-                self.reset();
-                self.cur_x = fb.cur_x;
-                self.cur_y = fb.cur_y;
+                if pred.epoch > self.confirmed_epoch {
+                    let ep = pred.epoch;
+                    self.kill_epoch(ep);
+                } else {
+                    self.reset();
+                    self.cur_x = fb.cur_x;
+                    self.cur_y = fb.cur_y;
+                }
                 return;
             };
             if cell.ch == pred.ch {
-                // Default blank matches space pred before host echo — stall
-                // until host cursor advanced past this cell.
                 if pred.ch == ' ' && is_default_blank(cell) && fb.cur_x <= pred.x {
                     break;
                 }
                 if Instant::now().saturating_duration_since(pred.at) < GLITCH_THRESHOLD {
                     quick = true;
                 }
+                // Advance confidence band (stock confirmed_epoch).
+                if pred.epoch > self.confirmed_epoch {
+                    self.confirmed_epoch = pred.epoch;
+                }
                 confirmed += 1;
             } else if (cell.ch == ' ' || cell.ch == '\0') && pred.ch != ' ' {
                 break;
+            } else if pred.epoch > self.confirmed_epoch {
+                let ep = pred.epoch;
+                self.kill_epoch(ep);
+                return;
             } else {
                 self.reset();
                 self.cur_x = fb.cur_x;
@@ -533,12 +617,14 @@ impl Predictor {
     }
 
     /// Overlay predictions; underline only when flagging (stock).
+    /// Tentative preds (epoch > confirmed_epoch) are hidden until proven.
     pub fn overlay(&self, fb: &mut Framebuffer) {
         if !self.active || !self.show {
             return;
         }
         for pred in &self.pending {
-            if pred.epoch != self.epoch {
+            // Stock: if tentative(confirmed_epoch) skip
+            if pred.epoch > self.confirmed_epoch {
                 continue;
             }
             if let Some(cell) = fb.cell_at_mut(pred.x, pred.y) {
@@ -688,6 +774,16 @@ impl DisplayPipeline {
         self.using_overlay_path
     }
 
+    /// Feed SSP sent/acked watermarks into the predictor.
+    pub fn set_frames(&mut self, sent: u64, acked: u64) {
+        self.predictor.set_frames(sent, acked);
+    }
+
+    #[cfg(test)]
+    pub fn set_frames_for_test(&mut self, sent: u64, acked: u64) {
+        self.set_frames(sent, acked);
+    }
+
     /// Resize local model; returns a full redraw for the PTY when size changes.
     pub fn resize(&mut self, cols: usize, rows: usize) -> Vec<u8> {
         if cols == self.host_fb.cols && rows == self.host_fb.rows {
@@ -757,9 +853,10 @@ impl DisplayPipeline {
     /// HostBytes (or raw hoststring) arrived from mosh-server.
     pub fn on_host_bytes(&mut self, hoststring: &[u8]) -> Vec<u8> {
         crate::ansi_apply::apply_ansi_with_pen(&mut self.host_fb, &mut self.pen, hoststring);
-        // Destructive clears invalidate pending (blank cells would stall Confirm).
+        // Destructive clears wipe pending (blank cells would stall Confirm and
+        // ghost underlines; stronger than become_tentative).
         if hoststring_is_destructive_clear(hoststring) {
-            self.predictor.become_tentative();
+            self.predictor.reset();
         }
         self.predictor
             .set_cursor(self.host_fb.cur_x, self.host_fb.cur_y);

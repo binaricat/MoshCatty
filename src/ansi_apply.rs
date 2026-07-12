@@ -291,6 +291,26 @@ fn apply_csi(fb: &mut Framebuffer, pen: &mut AnsiPen, params: &[u8], final_byte:
                 }
             }
         }
+        b'@' => {
+            // ICH — insert n blank cells at cursor
+            let n = nums.first().copied().unwrap_or(1).max(1) as usize;
+            insert_chars(fb, n);
+        }
+        b'P' => {
+            // DCH — delete n cells at cursor
+            let n = nums.first().copied().unwrap_or(1).max(1) as usize;
+            delete_chars(fb, n);
+        }
+        b'L' => {
+            // IL — insert n blank lines
+            let n = nums.first().copied().unwrap_or(1).max(1) as usize;
+            insert_lines(fb, n);
+        }
+        b'M' => {
+            // DL — delete n lines
+            let n = nums.first().copied().unwrap_or(1).max(1) as usize;
+            delete_lines(fb, n);
+        }
         b'm' => apply_sgr(pen, &nums),
         b'h' if private => {
             if nums.contains(&25) {
@@ -303,6 +323,98 @@ fn apply_csi(fb: &mut Framebuffer, pen: &mut AnsiPen, params: &[u8], final_byte:
             }
         }
         _ => {}
+    }
+}
+
+fn insert_chars(fb: &mut Framebuffer, n: usize) {
+    let y = fb.cur_y;
+    let x = fb.cur_x;
+    if y >= fb.rows || x >= fb.cols || n == 0 {
+        return;
+    }
+    let n = n.min(fb.cols - x);
+    // Shift right from end
+    for col in (x..fb.cols - n).rev() {
+        if let (Some(src), Some(dst)) = (fb.cell_at(col, y).copied(), fb.cell_at_mut(col + n, y)) {
+            *dst = src;
+        }
+    }
+    for col in x..x + n {
+        if let Some(c) = fb.cell_at_mut(col, y) {
+            *c = Default::default();
+        }
+    }
+}
+
+fn delete_chars(fb: &mut Framebuffer, n: usize) {
+    let y = fb.cur_y;
+    let x = fb.cur_x;
+    if y >= fb.rows || x >= fb.cols || n == 0 {
+        return;
+    }
+    let n = n.min(fb.cols - x);
+    for col in x..fb.cols - n {
+        if let (Some(src), Some(dst)) = (fb.cell_at(col + n, y).copied(), fb.cell_at_mut(col, y)) {
+            *dst = src;
+        }
+    }
+    for col in (fb.cols - n)..fb.cols {
+        if let Some(c) = fb.cell_at_mut(col, y) {
+            *c = Default::default();
+        }
+    }
+}
+
+fn insert_lines(fb: &mut Framebuffer, n: usize) {
+    let y = fb.cur_y;
+    if y >= fb.rows || n == 0 {
+        return;
+    }
+    let n = n.min(fb.rows - y);
+    let cols = fb.cols;
+    // Shift rows down
+    for row in (y..fb.rows - n).rev() {
+        for col in 0..cols {
+            if let (Some(src), Some(dst)) = (
+                fb.cell_at(col, row).copied(),
+                fb.cell_at_mut(col, row + n),
+            ) {
+                *dst = src;
+            }
+        }
+    }
+    for row in y..y + n {
+        for col in 0..cols {
+            if let Some(c) = fb.cell_at_mut(col, row) {
+                *c = Default::default();
+            }
+        }
+    }
+}
+
+fn delete_lines(fb: &mut Framebuffer, n: usize) {
+    let y = fb.cur_y;
+    if y >= fb.rows || n == 0 {
+        return;
+    }
+    let n = n.min(fb.rows - y);
+    let cols = fb.cols;
+    for row in y..fb.rows - n {
+        for col in 0..cols {
+            if let (Some(src), Some(dst)) = (
+                fb.cell_at(col, row + n).copied(),
+                fb.cell_at_mut(col, row),
+            ) {
+                *dst = src;
+            }
+        }
+    }
+    for row in (fb.rows - n)..fb.rows {
+        for col in 0..cols {
+            if let Some(c) = fb.cell_at_mut(col, row) {
+                *c = Default::default();
+            }
+        }
     }
 }
 
@@ -434,5 +546,28 @@ mod tests {
         let mut fb = Framebuffer::new(80, 24);
         apply_ansi(&mut fb, b"\x1b[4ma\x1b[24m");
         assert!(fb.cell_at(0, 0).unwrap().attr.under);
+    }
+
+    #[test]
+    fn ich_inserts_blanks() {
+        let mut fb = Framebuffer::new(10, 3);
+        apply_ansi(&mut fb, b"\x1b[Habc");
+        assert_eq!(fb.cell_at(0, 0).unwrap().ch, 'a');
+        apply_ansi(&mut fb, b"\x1b[1;1H\x1b[2@");
+        assert_eq!(fb.cell_at(0, 0).unwrap().ch, ' ');
+        assert_eq!(fb.cell_at(1, 0).unwrap().ch, ' ');
+        assert_eq!(fb.cell_at(2, 0).unwrap().ch, 'a');
+        assert_eq!(fb.cell_at(3, 0).unwrap().ch, 'b');
+        assert_eq!(fb.cell_at(4, 0).unwrap().ch, 'c');
+    }
+
+    #[test]
+    fn dch_deletes_chars() {
+        let mut fb = Framebuffer::new(10, 3);
+        apply_ansi(&mut fb, b"\x1b[Habcde");
+        apply_ansi(&mut fb, b"\x1b[1;2H\x1b[2P"); // delete 2 at col 1
+        assert_eq!(fb.cell_at(0, 0).unwrap().ch, 'a');
+        assert_eq!(fb.cell_at(1, 0).unwrap().ch, 'd');
+        assert_eq!(fb.cell_at(2, 0).unwrap().ch, 'e');
     }
 }

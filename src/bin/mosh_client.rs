@@ -115,7 +115,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        let mode_paint = display.set_srtt(client.srtt());
+        let mode_paint = display.set_srtt(client.send_interval().or_else(|| client.srtt()));
         if !mode_paint.is_empty() {
             stdout.write_all(&mode_paint)?;
             stdout.flush()?;

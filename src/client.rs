@@ -112,6 +112,15 @@ impl Client {
         self.transport.acked_by_remote()
     }
 
+    /// Stock prediction uses ~SRTT/2 clamped to 20–250ms as `send_interval`.
+    pub fn send_interval(&self) -> Option<std::time::Duration> {
+        self.srtt().map(|d| {
+            let half_ms = (d.as_millis() as u64) / 2;
+            let ms = half_ms.clamp(20, 250);
+            std::time::Duration::from_millis(ms)
+        })
+    }
+
     /// Poll network + flush pending ticks. Returns newly painted local bytes.
     pub fn poll(&mut self) -> Result<Vec<u8>> {
         if self.dead {

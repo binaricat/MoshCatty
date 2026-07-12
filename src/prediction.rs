@@ -296,6 +296,7 @@ impl Predictor {
                 });
                 self.cur_x = cx.saturating_add(1);
                 self.active = true;
+                self.sort_pending();
             }
         }
     }
@@ -414,6 +415,7 @@ impl Predictor {
         self.cur_x = cx;
         if had_own {
             self.pending = next;
+            self.sort_pending();
             self.active = true;
             return;
         }
@@ -458,6 +460,7 @@ impl Predictor {
                 expiration_sent: exp,
             });
         }
+        self.sort_pending();
         self.active = true;
     }
 
@@ -493,11 +496,20 @@ impl Predictor {
     }
 
     /// mosh-go `SetCursor` — only tracks server cursor when inactive.
+    /// Stock: prove anew on each row — row change becomes tentative.
     pub fn set_cursor(&mut self, x: usize, y: usize) {
         if !self.active {
+            if y != self.cur_y {
+                self.become_tentative();
+            }
             self.cur_x = x;
             self.cur_y = y;
         }
+    }
+
+    /// Stable L→R, top→bottom order for Confirm (after mid-line insert/BS).
+    fn sort_pending(&mut self) {
+        self.pending.sort_by(|a, b| (a.y, a.x).cmp(&(b.y, b.x)));
     }
 
     /// mosh-go ExpireStale + stock glitch sampling on oldest pending age.
@@ -614,8 +626,9 @@ impl Predictor {
                 if Instant::now().saturating_duration_since(pred_at) < GLITCH_THRESHOLD {
                     quick = true;
                 }
-                // Advance confidence band (stock confirmed_epoch).
-                if pred_epoch > self.confirmed_epoch {
+                // Stock CorrectNoCredit: blank/space matches do not prove a band.
+                let no_credit = pred_ch == ' ' || is_default_blank(cell);
+                if !no_credit && pred_epoch > self.confirmed_epoch {
                     self.confirmed_epoch = pred_epoch;
                 }
                 confirmed += 1;
@@ -663,11 +676,22 @@ impl Predictor {
             if pred.epoch > self.confirmed_epoch {
                 continue;
             }
+            let left_attr = if pred.x > 0 {
+                fb.cell_at(pred.x - 1, pred.y).map(|c| c.attr)
+            } else {
+                None
+            };
             if let Some(cell) = fb.cell_at_mut(pred.x, pred.y) {
                 cell.ch = pred.ch;
                 cell.width = 1;
+                // Stock heuristic: match renditions of the cell to the left.
+                if let Some(attr) = left_attr {
+                    cell.attr = attr;
+                }
                 if self.flagging {
                     cell.attr.under = true;
+                } else {
+                    cell.attr.under = false;
                 }
             }
         }

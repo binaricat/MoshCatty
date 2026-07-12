@@ -271,6 +271,50 @@ fn kill_epoch_drains_matched_prefix() {
 }
 
 #[test]
+fn left_cell_attr_inherited_on_overlay() {
+    let mut p = always();
+    let mut fb = blank_fb();
+    // Host paints bold 'P' then we predict 'x' to the right
+    use crate::framebuffer::Attr;
+    let mut bold = Attr::default();
+    bold.bold = true;
+    fb.put_rune(0, 0, 'P', bold);
+    p.set_cursor(1, 0);
+    p.keystroke(b"x", &fb);
+    p.overlay(&mut fb);
+    assert_eq!(fb.cell_at(1, 0).unwrap().ch, 'x');
+    assert!(fb.cell_at(1, 0).unwrap().attr.bold, "inherit bold from left");
+    assert!(fb.cell_at(1, 0).unwrap().attr.under, "Always flagging");
+}
+
+#[test]
+fn send_interval_adaptive_thresholds() {
+    // send_interval ~40ms (from 80ms RTT/2) is between show-on(30) and flag(80)
+    let mut p = adaptive();
+    p.set_srtt(Some(Duration::from_millis(40)));
+    assert!(p.should_show());
+    assert!(!p.flagging());
+}
+
+#[test]
+fn row_change_becomes_tentative() {
+    let mut p = always();
+    p.set_cursor(0, 0);
+    p.keystroke(b"a", &blank_fb());
+    let ep0 = p.prediction_epoch_for_test();
+    // Simulate host moving to next row while inactive after confirm
+    let mut fb = blank_fb();
+    fb.put_rune(0, 0, 'a', Attr::default());
+    fb.cur_x = 1;
+    p.confirm(&fb);
+    p.set_cursor(0, 1); // row change
+    assert!(
+        p.prediction_epoch_for_test() > ep0,
+        "row change must become_tentative"
+    );
+}
+
+#[test]
 fn pipeline_with_frames_confirm_after_ack() {
     let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Always);
     pipe.set_frames_for_test(2, 2);
@@ -314,18 +358,18 @@ fn insert_mid_pending_shifts_trailing() {
     p.keystroke(b"abcd", &blank_fb());
     p.keystroke(b"\x1b[D\x1b[D", &blank_fb()); // cursor at 2
     p.keystroke(b"x", &blank_fb());
-    // Expect a@0 b@1 x@2 c@3 d@4
+    // Sorted L→R: a@0 b@1 x@2 c@3 d@4
     assert_eq!(p.pending_len(), 5);
-    assert_eq!(p.pending_char(0), Some('a'));
-    assert_eq!(p.pending_pos(0), Some((0, 0)));
-    assert_eq!(p.pending_char(1), Some('b'));
-    assert_eq!(p.pending_pos(1), Some((1, 0)));
-    assert_eq!(p.pending_char(2), Some('c')); // shifted
-    assert_eq!(p.pending_pos(2), Some((3, 0)));
-    assert_eq!(p.pending_char(3), Some('d'));
-    assert_eq!(p.pending_pos(3), Some((4, 0)));
-    assert_eq!(p.pending_char(4), Some('x'));
-    assert_eq!(p.pending_pos(4), Some((2, 0)));
+    let mut by_col = std::collections::BTreeMap::new();
+    for i in 0..p.pending_len() {
+        let (x, _) = p.pending_pos(i).unwrap();
+        by_col.insert(x, p.pending_char(i).unwrap());
+    }
+    assert_eq!(by_col.get(&0), Some(&'a'));
+    assert_eq!(by_col.get(&1), Some(&'b'));
+    assert_eq!(by_col.get(&2), Some(&'x'));
+    assert_eq!(by_col.get(&3), Some(&'c'));
+    assert_eq!(by_col.get(&4), Some(&'d'));
     let mut fb = blank_fb();
     p.overlay(&mut fb);
     assert_eq!(fb.cell_at(0, 0).unwrap().ch, 'a');

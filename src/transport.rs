@@ -158,6 +158,16 @@ impl Transport {
         self.rto
     }
 
+    /// Smoothed RTT once at least one timestamp sample has been observed.
+    /// Used by local prediction (`MOSH_PREDICTION_DISPLAY=adaptive`).
+    pub fn srtt(&self) -> Option<Duration> {
+        if self.rtt_init {
+            Some(self.srtt)
+        } else {
+            None
+        }
+    }
+
     /// Time of last successfully authenticated inbound datagram.
     pub fn last_recv(&self) -> Instant {
         self.last_recv

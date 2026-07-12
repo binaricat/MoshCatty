@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use moshcatty::Client;
+use moshcatty::{Client, DisplayPipeline, DisplayPreference};
 
 fn main() {
     if let Err(e) = run() {
@@ -95,6 +95,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // alternate screen, restore primary buffer (and cursor/mouse modes) on exit.
     // Set MOSH_NO_TERM_INIT=1 to skip (same env as upstream mosh).
     let _display = DisplaySession::enter(&mut stdout)?;
+    // mosh-go / stock shape: HostBytes → client Framebuffer → Confirm →
+    // Overlay → Diff(last_shown) → single PTY stream. Never dual-write raw
+    // predicted glyphs beside HostBytes (Netcatty #2121).
+    let mut display =
+        DisplayPipeline::new(cols as usize, rows as usize, DisplayPreference::from_env());
     let mut last_resize_check = Instant::now();
     let mut cur_cols = cols;
     let mut cur_rows = rows;
@@ -107,25 +112,63 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        let paint = client.poll()?;
-        if !paint.is_empty() {
-            stdout.write_all(&paint)?;
+        let mode_paint = display.set_srtt(client.send_interval().or_else(|| client.srtt()));
+        if !mode_paint.is_empty() {
+            stdout.write_all(&mode_paint)?;
+            stdout.flush()?;
+        }
+        // Stock prediction: sent/early-ack (transport) + late-ack (echo_ack).
+        display.set_frames(
+            client.sent_num(),
+            client.acked_by_remote(),
+            client.echo_ack(),
+        );
+
+        let host_paint = client.poll()?;
+        if !host_paint.is_empty() {
+            // Refresh acks after poll (may have advanced).
+            display.set_frames(
+                client.sent_num(),
+                client.acked_by_remote(),
+                client.echo_ack(),
+            );
+            let out = display.on_host_bytes(&host_paint);
+            if !out.is_empty() {
+                stdout.write_all(&out)?;
+                stdout.flush()?;
+            }
+        }
+
+        // mosh-go ExpireStale: tick even when the server is quiet.
+        let tick_paint = display.tick(Instant::now());
+        if !tick_paint.is_empty() {
+            stdout.write_all(&tick_paint)?;
             stdout.flush()?;
         }
 
         match stdin_rx.try_recv() {
-            Ok(Some(buf)) if !buf.is_empty() => client.send_keys(&buf),
+            Ok(Some(buf)) if !buf.is_empty() => {
+                let local = display.on_keystroke(&buf);
+                if !local.is_empty() {
+                    stdout.write_all(&local)?;
+                    stdout.flush()?;
+                }
+                client.send_keys(&buf);
+            }
             Ok(None) => {
                 // EOF: drain remaining paint briefly then exit (PTY closed).
                 let deadline = Instant::now() + Duration::from_secs(2);
                 while Instant::now() < deadline && !client.is_dead() {
-                    let paint = client.poll()?;
-                    if paint.is_empty() {
+                    let host_paint = client.poll()?;
+                    if host_paint.is_empty() {
                         thread::sleep(Duration::from_millis(10));
                         continue;
                     }
-                    stdout.write_all(&paint)?;
-                    stdout.flush()?;
+                    let out = display.on_host_bytes(&host_paint);
+                    if !out.is_empty() {
+                        stdout.write_all(&out)?;
+                        stdout.flush()?;
+                    }
                 }
                 break;
             }
@@ -140,6 +183,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     cur_cols = c;
                     cur_rows = r;
                     client.resize(c, r);
+                    let redraw = display.resize(c as usize, r as usize);
+                    if !redraw.is_empty() {
+                        stdout.write_all(&redraw)?;
+                        stdout.flush()?;
+                    }
                 }
             }
             last_resize_check = Instant::now();

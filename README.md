@@ -65,6 +65,9 @@ Peer products either skip Windows Mosh or own a private engine. MoshCatty is the
 - **Wire-compatible** with stock `mosh-server` 1.4.x (protocol v2)
 - **Cross-platform**: Linux / macOS / Windows (no Cygwin runtime)
 - **Drop-in CLI**: `MOSH_KEY=<key> mosh-client <host> <port>`
+- **Speculative local echo** (mosh-go shape): client Framebuffer + Confirm +
+  Overlay + single Diff stream (`MOSH_PREDICTION_DISPLAY=adaptive|always|never`).
+  See `docs/prediction.md`.
 - **Library API** (`moshcatty` crate) for embedders
 - **RFC 7253** AES-128-OCB3 + mosh-go interop vectors in CI
 - **Netcatty-ready**: fits existing SSH bootstrap + node-pty swap

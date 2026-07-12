@@ -98,6 +98,34 @@ impl Client {
         self.dead_reason.as_deref()
     }
 
+    /// Smoothed RTT from the transport, if any sample is available.
+    pub fn srtt(&self) -> Option<std::time::Duration> {
+        self.transport.srtt()
+    }
+
+    /// SSP state numbers for stock-style prediction frame expiry.
+    pub fn sent_num(&self) -> u64 {
+        self.transport.sent_num()
+    }
+
+    pub fn acked_by_remote(&self) -> u64 {
+        self.transport.acked_by_remote()
+    }
+
+    /// Stock late_ack: max echo_ack_num from HostInstructions (prediction Pending).
+    pub fn echo_ack(&self) -> u64 {
+        self.terminal.echo_ack()
+    }
+
+    /// Stock prediction uses ~SRTT/2 clamped to 20–250ms as `send_interval`.
+    pub fn send_interval(&self) -> Option<std::time::Duration> {
+        self.srtt().map(|d| {
+            let half_ms = (d.as_millis() as u64) / 2;
+            let ms = half_ms.clamp(20, 250);
+            std::time::Duration::from_millis(ms)
+        })
+    }
+
     /// Poll network + flush pending ticks. Returns newly painted local bytes.
     pub fn poll(&mut self) -> Result<Vec<u8>> {
         if self.dead {

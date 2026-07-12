@@ -23,7 +23,7 @@ Never require terminfo / Cygwin / system mosh.
 | Printable | insert shift | pending | pending + host-row insert + mid shift (any epoch) |
 | Backspace | row shift / overwrite space | Reset | undo / pending shift / host-row BS / overwrite space |
 | Overwrite mode | CLI flag | n/a | `MOSH_PREDICTION_OVERWRITE` (print + BS) |
-| L/R arrows | CSI C/D | none | CSI + SS3 + cursor_exp until ack |
+| L/R arrows | CSI C/D (+params as +1) | none | CSI n C/D (count, clamp) + SS3 + cursor_exp until ack |
 | CR | tentative + row | n/a | tentative + row (no scroll) |
 | Tentative epochs | hide until proven | n/a | hide epoch > confirmed |
 | Frame Pending | late_ack | n/a | acked vs expiration_sent |
@@ -32,7 +32,7 @@ Never require terminfo / Cygwin / system mosh.
 | Flagging | 80/50 ms | always under | 80/50 ms |
 | Glitch | 250ms / 5s + 150ms repair | 500ms expire | true-oldest age + no empty latch |
 | Row change | prove anew | n/a | become_tentative |
-| Renditions | match left | n/a | inherit left Attr |
+| Renditions | match left + Correct row cascade | n/a | inherit left Attr; Correct copies host Attr to rest of row |
 | CorrectNoCredit | blank/noop/unknown | n/a | space/noop/unknown |
 | unknown cells | underline only | n/a | underline only (no glyph replace) |
 | Last column | place + tentative + wrap | n/a | same |
@@ -42,6 +42,7 @@ Never require terminfo / Cygwin / system mosh.
 | Structural host ops | cull | n/a | ICH/DCH/IL/DL/ED/EL/ECH (incl. split CSI via carry) + bottom scroll → reset pending |
 | SS3 non L/R | tentative | n/a | consume ESC O X fully (no printable pollution) |
 | Bulk paste | reset >100 | always | reset >100 |
+| Keystroke UTF-8 | parser stream | n/a | sticky multi-byte carry across keystroke chunks |
 
 ## Env
 

@@ -81,6 +81,8 @@ struct Prediction {
     original_ch: char,
     /// Stock `unknown` — never diverge; CorrectNoCredit only.
     unknown: bool,
+    /// After a credited Correct, stock copies host renditions to the rest of the row.
+    overlay_attr: Option<crate::framebuffer::Attr>,
 }
 
 /// mosh-go pending list + stock tentative / frame-ack / flagging / BS / arrows.
@@ -273,81 +275,98 @@ impl Predictor {
                 }
             }
 
-            let (ch, len) = decode_utf8_char(&data, i);
-            i += len;
-
-            if ch == '\u{FFFD}' && len == 1 {
-                self.become_tentative();
-                continue;
-            }
-            if ch == '\u{08}' || ch == '\u{7f}' {
-                self.predict_backspace(fb);
-                continue;
-            }
-            if (ch as u32) < 0x20 {
-                self.become_tentative();
-                if ch == '\r' {
-                    // Stock newline_carriage_return (no scroll prediction at bottom).
-                    self.cur_x = 0;
-                    if self.cur_y + 1 < fb.rows {
-                        self.cur_y += 1;
-                    }
-                    self.active = true;
-                    self.cursor_exp_sent = Some(self.local_frame_sent.saturating_add(1));
+            // Incomplete multi-byte UTF-8 across keystroke chunks (ConPTY splits).
+            match decode_utf8_input(&data, i) {
+                Utf8Input::NeedMore => {
+                    self.esc_buf = data[i..].to_vec();
+                    return;
                 }
-                continue;
-            }
-            if is_print(ch) {
-                let w = unicode_width_approx(ch);
-                // Stock: non-width-1 (wide / combining / control print) → tentative only.
-                if w != 1 {
+                Utf8Input::Invalid(n) => {
+                    i += n.max(1);
                     self.become_tentative();
                     continue;
                 }
-                let cx = self.cur_x;
-                let cy = self.cur_y;
-                // Last column: stock still places, becomes tentative, then wraps.
-                let at_last_col = cx + 1 >= fb.cols;
-                if at_last_col {
-                    self.become_tentative();
-                }
-                // Insert-mode: shift ALL same-row pending at/after cursor (any epoch).
-                if !self.overwrite && !at_last_col {
-                    for p in &mut self.pending {
-                        if p.y == cy && p.x >= cx {
-                            p.x = p.x.saturating_add(1);
-                        }
-                    }
-                    self.pending.retain(|p| p.x < fb.cols);
-                    self.predict_host_insert(fb, cx, cy, ch);
-                } else if self.overwrite {
-                    let orig = fb.cell_at(cx, cy).map(|c| c.ch).unwrap_or(' ');
-                    // Last-col overwrite is unknown (shell/emacs disagree).
-                    self.pending.push(self.make_pred(ch, cx, cy, orig, at_last_col));
-                    if at_last_col {
-                        self.cur_x = 0;
-                        if self.cur_y + 1 < fb.rows {
-                            self.cur_y += 1;
-                        }
-                        self.cursor_exp_sent = Some(self.local_frame_sent.saturating_add(1));
-                    } else {
-                        self.cur_x = cx.saturating_add(1);
-                    }
-                    self.active = true;
-                    self.sort_pending();
-                } else {
-                    // Insert at last col: place as unknown, wrap cursor (no bottom scroll).
-                    let orig = fb.cell_at(cx, cy).map(|c| c.ch).unwrap_or(' ');
-                    self.pending.push(self.make_pred(ch, cx, cy, orig, true));
-                    self.cur_x = 0;
-                    if self.cur_y + 1 < fb.rows {
-                        self.cur_y += 1;
-                    }
-                    self.cursor_exp_sent = Some(self.local_frame_sent.saturating_add(1));
-                    self.active = true;
-                    self.sort_pending();
+                Utf8Input::Char(ch, len) => {
+                    i += len;
+                    self.handle_decoded_char(ch, fb);
                 }
             }
+        }
+    }
+
+    fn handle_decoded_char(&mut self, ch: char, fb: &Framebuffer) {
+        if ch == '\u{FFFD}' {
+            self.become_tentative();
+            return;
+        }
+        if ch == '\u{08}' || ch == '\u{7f}' {
+            self.predict_backspace(fb);
+            return;
+        }
+        if (ch as u32) < 0x20 {
+            self.become_tentative();
+            if ch == '\r' {
+                // Stock newline_carriage_return (no scroll prediction at bottom).
+                self.cur_x = 0;
+                if self.cur_y + 1 < fb.rows {
+                    self.cur_y += 1;
+                }
+                self.active = true;
+                self.cursor_exp_sent = Some(self.local_frame_sent.saturating_add(1));
+            }
+            return;
+        }
+        if !is_print(ch) {
+            return;
+        }
+        let w = unicode_width_approx(ch);
+        // Stock: non-width-1 (wide / combining / control print) → tentative only.
+        if w != 1 {
+            self.become_tentative();
+            return;
+        }
+        let cx = self.cur_x;
+        let cy = self.cur_y;
+        // Last column: stock still places, becomes tentative, then wraps.
+        let at_last_col = cx + 1 >= fb.cols;
+        if at_last_col {
+            self.become_tentative();
+        }
+        // Insert-mode: shift ALL same-row pending at/after cursor (any epoch).
+        if !self.overwrite && !at_last_col {
+            for p in &mut self.pending {
+                if p.y == cy && p.x >= cx {
+                    p.x = p.x.saturating_add(1);
+                }
+            }
+            self.pending.retain(|p| p.x < fb.cols);
+            self.predict_host_insert(fb, cx, cy, ch);
+        } else if self.overwrite {
+            let orig = fb.cell_at(cx, cy).map(|c| c.ch).unwrap_or(' ');
+            // Last-col overwrite is unknown (shell/emacs disagree).
+            self.pending.push(self.make_pred(ch, cx, cy, orig, at_last_col));
+            if at_last_col {
+                self.cur_x = 0;
+                if self.cur_y + 1 < fb.rows {
+                    self.cur_y += 1;
+                }
+                self.cursor_exp_sent = Some(self.local_frame_sent.saturating_add(1));
+            } else {
+                self.cur_x = cx.saturating_add(1);
+            }
+            self.active = true;
+            self.sort_pending();
+        } else {
+            // Insert at last col: place as unknown, wrap cursor (no bottom scroll).
+            let orig = fb.cell_at(cx, cy).map(|c| c.ch).unwrap_or(' ');
+            self.pending.push(self.make_pred(ch, cx, cy, orig, true));
+            self.cur_x = 0;
+            if self.cur_y + 1 < fb.rows {
+                self.cur_y += 1;
+            }
+            self.cursor_exp_sent = Some(self.local_frame_sent.saturating_add(1));
+            self.active = true;
+            self.sort_pending();
         }
     }
 
@@ -386,27 +405,40 @@ impl Predictor {
             // ESC + non-CSI: control ESC only, reprocess second byte
             return ArrowParse::NotArrow(1);
         }
+        // CSI [params] final — L/R arrows accept optional count (CSI n C / CSI n D).
         let mut j = 2;
-        let mut saw_param = false;
+        let mut param: u32 = 0;
+        let mut saw_digit = false;
         while j < bytes.len() {
             let c = bytes[j];
-            if (b'0'..=b'9').contains(&c) || c == b';' {
-                saw_param = true;
+            if (b'0'..=b'9').contains(&c) {
+                saw_digit = true;
+                param = param
+                    .saturating_mul(10)
+                    .saturating_add(u32::from(c - b'0'));
                 j += 1;
+                continue;
+            }
+            if c == b';' {
+                // Extra params: skip to final (only first count used for C/D).
+                j += 1;
+                while j < bytes.len()
+                    && ((b'0'..=b'9').contains(&bytes[j]) || bytes[j] == b';')
+                {
+                    j += 1;
+                }
                 continue;
             }
             if (b'@'..=b'~').contains(&c) {
                 j += 1;
-                if saw_param {
-                    return ArrowParse::NotArrow(j);
-                }
+                let n = if saw_digit { param.max(1) as usize } else { 1 };
                 return match c {
                     b'C' => {
-                        self.move_cursor_right(fb);
+                        self.move_cursor_right_n(n, fb);
                         ArrowParse::Handled(j)
                     }
                     b'D' => {
-                        self.move_cursor_left();
+                        self.move_cursor_left_n(n);
                         ArrowParse::Handled(j)
                     }
                     _ => ArrowParse::NotArrow(j),
@@ -415,25 +447,40 @@ impl Predictor {
             if (b' '..=b'/').contains(&c) {
                 return ArrowParse::NotArrow(j + 1);
             }
+            // Unexpected intermediate — treat as incomplete only if more may come
+            // with valid digits; otherwise skip.
             j += 1;
         }
         ArrowParse::NeedMore
     }
 
     fn move_cursor_left(&mut self) {
-        if self.cur_x > 0 {
-            self.cur_x -= 1;
-            self.active = true;
-            self.cursor_exp_sent = Some(self.local_frame_sent.saturating_add(1));
-        }
+        self.move_cursor_left_n(1);
     }
 
     fn move_cursor_right(&mut self, fb: &Framebuffer) {
-        if self.cur_x + 1 < fb.cols {
-            self.cur_x += 1;
-            self.active = true;
-            self.cursor_exp_sent = Some(self.local_frame_sent.saturating_add(1));
+        self.move_cursor_right_n(1, fb);
+    }
+
+    fn move_cursor_left_n(&mut self, n: usize) {
+        let n = n.max(1);
+        if self.cur_x == 0 {
+            return;
         }
+        self.cur_x = self.cur_x.saturating_sub(n);
+        self.active = true;
+        self.cursor_exp_sent = Some(self.local_frame_sent.saturating_add(1));
+    }
+
+    fn move_cursor_right_n(&mut self, n: usize, fb: &Framebuffer) {
+        let n = n.max(1);
+        let max_x = fb.cols.saturating_sub(1);
+        if self.cur_x >= max_x {
+            return;
+        }
+        self.cur_x = (self.cur_x + n).min(max_x);
+        self.active = true;
+        self.cursor_exp_sent = Some(self.local_frame_sent.saturating_add(1));
     }
 
     /// Undo own last pending glyph, shift own pending, or host-row insert BS.
@@ -468,6 +515,7 @@ impl Predictor {
                     expiration_sent: exp,
                     original_ch: orig,
                     unknown: x + 1 >= fb.cols,
+                    overlay_attr: None,
                 });
             }
         }
@@ -481,6 +529,7 @@ impl Predictor {
             expiration_sent: exp,
             original_ch: orig,
             unknown: false,
+            overlay_attr: None,
         });
         self.cur_x = cx.saturating_add(1);
         self.active = true;
@@ -569,6 +618,7 @@ impl Predictor {
                     expiration_sent: exp,
                     original_ch: orig,
                     unknown: x + 1 >= fb.cols.saturating_sub(1),
+                    overlay_attr: None,
                 });
             }
             self.pending.push(Prediction {
@@ -580,6 +630,7 @@ impl Predictor {
                 expiration_sent: exp,
                 original_ch: fb.cell_at(last_content, cy).map(|c| c.ch).unwrap_or(' '),
                 unknown: true,
+                overlay_attr: None,
             });
         }
         self.sort_pending();
@@ -652,6 +703,7 @@ impl Predictor {
             expiration_sent: self.local_frame_sent.saturating_add(1),
             original_ch,
             unknown,
+            overlay_attr: None,
         }
     }
 
@@ -822,6 +874,15 @@ impl Predictor {
                 if !no_credit && pred_epoch > self.confirmed_epoch {
                     self.confirmed_epoch = pred_epoch;
                 }
+                // Stock Correct: copy host cell renditions onto remaining same-row preds.
+                if !no_credit {
+                    let host_attr = cell.attr;
+                    for p in self.pending.iter_mut().skip(confirmed) {
+                        if p.y == pred_y {
+                            p.overlay_attr = Some(host_attr);
+                        }
+                    }
+                }
                 confirmed += 1;
             } else if pred_unknown {
                 // Stock unknown → CorrectNoCredit: drop without diverge.
@@ -916,15 +977,14 @@ impl Predictor {
             if let Some(cell) = fb.cell_at_mut(pred.x, pred.y) {
                 cell.ch = pred.ch;
                 cell.width = 1;
-                // Stock heuristic: match renditions of the cell to the left.
-                if let Some(attr) = left_attr {
+                // Prefer Correct-cascaded host renditions; else inherit left cell.
+                if let Some(attr) = pred.overlay_attr {
+                    cell.attr = attr;
+                } else if let Some(attr) = left_attr {
                     cell.attr = attr;
                 }
-                if self.flagging {
-                    cell.attr.under = true;
-                } else {
-                    cell.attr.under = false;
-                }
+                // Flagging underlines predictions (overrides inherited under).
+                cell.attr.under = self.flagging;
             }
         }
         if !self.pending.is_empty() || self.active {
@@ -1007,10 +1067,18 @@ fn hoststring_is_destructive_clear(data: &[u8]) -> bool {
     false
 }
 
-fn decode_utf8_char(data: &[u8], i: usize) -> (char, usize) {
+enum Utf8Input {
+    Char(char, usize),
+    /// Incomplete multi-byte sequence at end of buffer — carry for next chunk.
+    NeedMore,
+    /// Invalid lead/continuation; consume n bytes and become_tentative.
+    Invalid(usize),
+}
+
+fn decode_utf8_input(data: &[u8], i: usize) -> Utf8Input {
     let b0 = data[i];
     if b0 < 0x80 {
-        return (b0 as char, 1);
+        return Utf8Input::Char(b0 as char, 1);
     }
     let width = if b0 & 0xE0 == 0xC0 {
         2
@@ -1019,14 +1087,14 @@ fn decode_utf8_char(data: &[u8], i: usize) -> (char, usize) {
     } else if b0 & 0xF8 == 0xF0 {
         4
     } else {
-        return ('\u{FFFD}', 1);
+        return Utf8Input::Invalid(1);
     };
     if i + width > data.len() {
-        return ('\u{FFFD}', 1);
+        return Utf8Input::NeedMore;
     }
     match std::str::from_utf8(&data[i..i + width]) {
-        Ok(s) => (s.chars().next().unwrap_or('\u{FFFD}'), width),
-        Err(_) => ('\u{FFFD}', 1),
+        Ok(s) => Utf8Input::Char(s.chars().next().unwrap_or('\u{FFFD}'), width),
+        Err(_) => Utf8Input::Invalid(1),
     }
 }
 

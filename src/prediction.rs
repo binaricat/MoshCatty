@@ -1,20 +1,20 @@
-//! Speculative local echo: mosh-go pending-list core + stock fidelity extras.
+//! Speculative local echo: mosh-go pending-list core + stock overlay semantics.
 //!
 //! Base API matches [mosh-go `predict.go`](https://github.com/unixshells/mosh-go):
 //! pending `(rune, x, y)`, Confirm, Overlay, single Diff paint path.
 //!
-//! Stock extras (mobile-shell/mosh `terminaloverlay.cc`) for Termius-like feel:
-//! - Backspace undoes own predictions / shifts pending; host-row insert BS
-//!   when safe under frame-ack Pending semantics
-//! - Left/right arrow cursor prediction (CSI C/D, SS3)
+//! Prediction rules follow stock mobile-shell/mosh `terminaloverlay.cc` /
+//! `terminaloverlay.h` (not system mosh-client, terminfo, or Cygwin):
+//! - Epoch start `prediction=1` / `confirmed=0` — hide until credited Correct
+//! - `reset()` only becomes tentative (does not re-align confirmed)
 //! - Underline **flagging** hysteresis (80/50 ms), separate from show
-//! - Glitch triggers: long-pending preds force show / underline
-//! - **True tentative epochs**: become_tentative bumps epoch without wipe;
-//!   overlay hides preds with epoch > confirmed_epoch
-//! - **Frame-ack expiry**: preds stay Pending until local_frame_acked reaches
-//!   expiration_sent (stock late_ack vs expiration_frame)
+//! - Overlay: blank-on-blank no under; unknown underline-only (skip last col);
+//!   known cells apply only when differing from host, then flag under
+//! - Insert/BS shift the **full remaining row** (stock); overwrite BS → space
+//! - Glitch: any non-zero `glitch_trigger` forces show; `> REPAIR_COUNT` flags
+//! - Frame-ack Pending via late_ack (`echo_ack_num`) vs expiration_sent
 //!
-//! Never dual-write raw glyphs beside HostBytes.
+//! Never dual-write raw glyphs beside HostBytes. Pure Rust binary only.
 
 use std::time::{Duration, Instant};
 
@@ -120,16 +120,17 @@ impl Predictor {
             pending: Vec::new(),
             cur_x: 0,
             cur_y: 0,
-            // Start equal so the first keystrokes of a session are visible
-            // (stock starts 1/0 which hides until first prove; Termius-like
-            // UX prefers immediate echo — we still bump on become_tentative).
+            // Stock PredictionEngine: prediction_epoch=1, confirmed_epoch=0 so
+            // the first band is tentative until a credited Correct proves it.
             prediction_epoch: 1,
-            confirmed_epoch: 1,
+            confirmed_epoch: 0,
             active: false,
             confirmed: 0,
             preference,
+            // Stock: Always forces *show*, not flagging. Flagging follows
+            // send_interval hysteresis (and big glitch) in set_srtt.
             show: matches!(preference, DisplayPreference::Always),
-            flagging: matches!(preference, DisplayPreference::Always),
+            flagging: false,
             glitch_trigger: 0,
             esc_buf: Vec::new(),
             local_frame_sent: 0,
@@ -179,13 +180,14 @@ impl Predictor {
     /// Stock hysteresis for show + flagging + glitch sampling.
     pub fn set_srtt(&mut self, srtt: Option<Duration>) {
         match self.preference {
-            DisplayPreference::Always => {
-                self.show = true;
-                self.flagging = true;
-            }
             DisplayPreference::Never => {
                 self.show = false;
                 self.flagging = false;
+                return;
+            }
+            DisplayPreference::Always => {
+                // Stock: Always only forces *display* of predictions.
+                self.show = true;
             }
             DisplayPreference::Adaptive => {
                 let Some(d) = srtt else {
@@ -195,32 +197,31 @@ impl Predictor {
                 if d > SRTT_TRIGGER_HIGH {
                     self.show = true;
                 } else if d <= SRTT_TRIGGER_LOW {
-                    // Hold show while cell predictions exist. Cursor-only
-                    // (empty pending + cursor_exp_sent) must not latch show
-                    // forever, but also must not clobber glass-cursor active.
-                    if self.pending.is_empty() {
+                    // Stock: clear srtt_trigger only when !active().
+                    // active() includes cursor-only Pending (cursor_exp_sent).
+                    if self.pending.is_empty() && self.cursor_exp_sent.is_none() {
                         self.show = false;
-                        if self.cursor_exp_sent.is_none() {
-                            self.active = false;
-                        }
-                    }
-                }
-                // Underline flagging (stock FLAG_TRIGGER_*)
-                if d > FLAG_TRIGGER_HIGH {
-                    self.flagging = true;
-                } else if d <= FLAG_TRIGGER_LOW {
-                    self.flagging = false;
-                }
-                // Glitch only applies while predictions are still outstanding.
-                if !self.pending.is_empty() {
-                    if self.glitch_trigger > GLITCH_REPAIR_COUNT {
-                        self.flagging = true;
-                    }
-                    if self.glitch_trigger >= GLITCH_REPAIR_COUNT {
-                        self.show = true;
+                        self.active = false;
                     }
                 }
             }
+        }
+
+        // Flagging hysteresis is independent of Always (stock FLAG_TRIGGER_*).
+        if let Some(d) = srtt {
+            if d > FLAG_TRIGGER_HIGH {
+                self.flagging = true;
+            } else if d <= FLAG_TRIGGER_LOW {
+                self.flagging = false;
+            }
+        }
+        // Stock: any non-zero glitch_trigger participates in show;
+        // really-big glitches also force underlining.
+        if self.glitch_trigger > 0 {
+            self.show = true;
+        }
+        if self.glitch_trigger > GLITCH_REPAIR_COUNT {
+            self.flagging = true;
         }
     }
 
@@ -321,20 +322,19 @@ impl Predictor {
             self.become_tentative();
             return;
         }
-        if ch == '\u{08}' || ch == '\u{7f}' {
+        // Stock: only DEL (0x7f) is predicted BS. BS (0x08) is Execute → tentative.
+        if ch == '\u{7f}' {
             self.predict_backspace(fb);
+            return;
+        }
+        if ch == '\u{08}' {
+            self.become_tentative();
             return;
         }
         if (ch as u32) < 0x20 {
             self.become_tentative();
             if ch == '\r' {
-                // Stock newline_carriage_return (no scroll prediction at bottom).
-                self.cur_x = 0;
-                if self.cur_y + 1 < fb.rows {
-                    self.cur_y += 1;
-                }
-                self.active = true;
-                self.cursor_exp_sent = Some(self.local_frame_sent.saturating_add(1));
+                self.newline_carriage_return(fb);
             }
             return;
         }
@@ -349,47 +349,74 @@ impl Predictor {
         }
         let cx = self.cur_x;
         let cy = self.cur_y;
-        // Last column: stock still places, becomes tentative, then wraps.
+        // Last column: stock becomes tentative, places a *known* glyph, then
+        // becomes tentative again and wraps (newline_carriage_return).
         let at_last_col = cx + 1 >= fb.cols;
         if at_last_col {
             self.become_tentative();
         }
-        // Insert-mode: shift ALL same-row pending at/after cursor (any epoch).
+        // Insert-mode: stock full-row shift via dense row map (one cell per col).
         if !self.overwrite && !at_last_col {
-            for p in &mut self.pending {
-                if p.y == cy && p.x >= cx {
-                    p.x = p.x.saturating_add(1);
-                }
-            }
-            self.pending.retain(|p| p.x < fb.cols);
             self.predict_host_insert(fb, cx, cy, ch);
         } else if self.overwrite {
             let orig = fb.cell_at(cx, cy).map(|c| c.ch).unwrap_or(' ');
-            // Last-col overwrite is unknown (shell/emacs disagree).
+            // One cell per column: replace any prior pred at this coordinate
+            // (retype in overwrite must not stack duplicates for Confirm).
+            self.pending.retain(|p| !(p.y == cy && p.x == cx));
+            // Stock places known glyph even on last col (epoch hide covers ambiguity).
             self.pending
-                .push(self.make_pred(ch, cx, cy, orig, at_last_col));
+                .push(self.make_pred(ch, cx, cy, orig, false));
             if at_last_col {
-                self.cur_x = 0;
-                if self.cur_y + 1 < fb.rows {
-                    self.cur_y += 1;
-                }
-                self.cursor_exp_sent = Some(self.local_frame_sent.saturating_add(1));
+                self.become_tentative();
+                self.newline_carriage_return(fb);
             } else {
                 self.cur_x = cx.saturating_add(1);
+                self.active = true;
+                self.cursor_exp_sent = Some(self.local_frame_sent.saturating_add(1));
             }
-            self.active = true;
             self.sort_pending();
         } else {
-            // Insert at last col: place as unknown, wrap cursor (no bottom scroll).
+            // Insert at last col: place *known* glyph (not unknown), then wrap.
             let orig = fb.cell_at(cx, cy).map(|c| c.ch).unwrap_or(' ');
-            self.pending.push(self.make_pred(ch, cx, cy, orig, true));
-            self.cur_x = 0;
-            if self.cur_y + 1 < fb.rows {
-                self.cur_y += 1;
-            }
-            self.cursor_exp_sent = Some(self.local_frame_sent.saturating_add(1));
-            self.active = true;
+            self.pending.retain(|p| !(p.y == cy && p.x == cx));
+            self.pending.push(self.make_pred(ch, cx, cy, orig, false));
+            self.become_tentative();
+            self.newline_carriage_return(fb);
             self.sort_pending();
+        }
+    }
+
+    /// Stock `newline_carriage_return`: col=0; advance row or blank-predict last row.
+    fn newline_carriage_return(&mut self, fb: &Framebuffer) {
+        let exp = self.local_frame_sent.saturating_add(1);
+        self.cur_x = 0;
+        if self.cur_y + 1 >= fb.rows {
+            // Bottom row: do not predict scroll; blank-predict every column.
+            let ep = self.prediction_epoch;
+            let now = Instant::now();
+            let cy = self.cur_y;
+            self.pending.retain(|p| p.y != cy);
+            for x in 0..fb.cols {
+                let orig = fb.cell_at(x, cy).map(|c| c.ch).unwrap_or(' ');
+                self.pending.push(Prediction {
+                    ch: ' ',
+                    x,
+                    y: cy,
+                    epoch: ep,
+                    at: now,
+                    expiration_sent: exp,
+                    original_ch: orig,
+                    unknown: false,
+                    overlay_attr: None,
+                });
+            }
+            self.active = true;
+            self.cursor_exp_sent = Some(exp);
+            self.sort_pending();
+        } else {
+            self.cur_y += 1;
+            self.active = true;
+            self.cursor_exp_sent = Some(exp);
         }
     }
 
@@ -425,8 +452,14 @@ impl Predictor {
             };
         }
         if kind != b'[' {
-            // ESC + non-CSI: control ESC only, reprocess second byte
-            return ArrowParse::NotArrow(1);
+            // Stock Esc_Dispatch: become_tentative only — do NOT re-feed the
+            // second byte as a printable (Alt-x / ESC D / etc.).
+            if bytes.len() < 2 {
+                return ArrowParse::NeedMore;
+            }
+            self.become_tentative();
+            self.esc_buf.clear();
+            return ArrowParse::Handled(2);
         }
         // CSI [params] final — L/R arrows accept optional count (CSI n C / CSI n D).
         let mut j = 2;
@@ -450,25 +483,35 @@ impl Predictor {
             }
             if (b'@'..=b'~').contains(&c) {
                 j += 1;
-                let n = if saw_digit { param.max(1) as usize } else { 1 };
+                // Stock CSI C/D ignores parameters and always moves by one.
+                let _ = (saw_digit, param);
                 return match c {
                     b'C' => {
-                        self.move_cursor_right_n(n, fb);
+                        self.move_cursor_right_n(1, fb);
                         ArrowParse::Handled(j)
                     }
                     b'D' => {
-                        self.move_cursor_left_n(n);
+                        self.move_cursor_left_n(1);
                         ArrowParse::Handled(j)
                     }
-                    _ => ArrowParse::NotArrow(j),
+                    // Other CSI finals: tentative, fully consume (no glyph pollution).
+                    _ => {
+                        self.become_tentative();
+                        self.esc_buf.clear();
+                        ArrowParse::Handled(j)
+                    }
                 };
             }
             if (b' '..=b'/').contains(&c) {
-                return ArrowParse::NotArrow(j + 1);
+                // CSI intermediate: keep scanning to final; do not re-feed
+                // intermediates/finals as printables.
+                j += 1;
+                continue;
             }
-            // Unexpected intermediate — treat as incomplete only if more may come
-            // with valid digits; otherwise skip.
-            j += 1;
+            // Unexpected byte inside CSI — skip one and stop (tentative).
+            self.become_tentative();
+            self.esc_buf.clear();
+            return ArrowParse::Handled((j + 1).max(1));
         }
         ArrowParse::NeedMore
     }
@@ -502,30 +545,48 @@ impl Predictor {
         self.cursor_exp_sent = Some(self.local_frame_sent.saturating_add(1));
     }
 
-    /// Undo own last pending glyph, shift own pending, or host-row insert BS.
-    /// Host-row shifts use frame-ack Pending so Confirm will not diverge early.
-    /// Stock insert-mode printable into host line: shift host tail right, place ch.
+    /// Stock insert-mode printable: shift **every** column from rightmost down to
+    /// cursor+1 (overlay-or-host), place `ch` at cursor. One cell per column.
     fn predict_host_insert(&mut self, fb: &Framebuffer, cx: usize, cy: usize, ch: char) {
         let exp = self.local_frame_sent.saturating_add(1);
         let ep = self.prediction_epoch;
         let now = Instant::now();
-        let mut last_content = cx;
-        for x in (cx..fb.cols).rev() {
-            if let Some(c) = fb.cell_at(x, cy) {
-                if c.ch != ' ' && c.ch != '\0' {
-                    last_content = x;
-                    break;
-                }
+        let width = fb.cols;
+        let last = width.saturating_sub(1);
+
+        // Sparse overlay → dense row map (stock ConditionalOverlayRow).
+        let mut row: Vec<Option<Prediction>> = vec![None; width];
+        let mut rest = Vec::with_capacity(self.pending.len());
+        for p in self.pending.drain(..) {
+            if p.y == cy && p.x < width {
+                let x = p.x;
+                row[x] = Some(p);
+            } else {
+                rest.push(p);
             }
         }
-        if last_content > cx {
-            for x in (cx + 1..=last_content).rev() {
-                let src = fb.cell_at(x - 1, cy);
-                let sch = src
-                    .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
-                    .unwrap_or(' ');
+
+        // rightmost → cx+1: cell[i] ← cell[i-1] (overlay) or host[i-1]
+        if last > cx {
+            for x in (cx + 1..=last).rev() {
                 let orig = fb.cell_at(x, cy).map(|c| c.ch).unwrap_or(' ');
-                self.pending.push(Prediction {
+                let (sch, unknown) = if x == last {
+                    // Last column: always unknown after insert shift.
+                    (' ', true)
+                } else if let Some(prev) = row[x - 1].as_ref() {
+                    if prev.unknown {
+                        (' ', true)
+                    } else {
+                        (prev.ch, false)
+                    }
+                } else {
+                    let src = fb.cell_at(x - 1, cy);
+                    let sch = src
+                        .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
+                        .unwrap_or(' ');
+                    (sch, false)
+                };
+                row[x] = Some(Prediction {
                     ch: sch,
                     x,
                     y: cy,
@@ -533,13 +594,14 @@ impl Predictor {
                     at: now,
                     expiration_sent: exp,
                     original_ch: orig,
-                    unknown: x + 1 >= fb.cols,
+                    unknown,
                     overlay_attr: None,
                 });
             }
         }
+
         let orig = fb.cell_at(cx, cy).map(|c| c.ch).unwrap_or(' ');
-        self.pending.push(Prediction {
+        row[cx] = Some(Prediction {
             ch,
             x: cx,
             y: cy,
@@ -550,8 +612,14 @@ impl Predictor {
             unknown: false,
             overlay_attr: None,
         });
+
+        self.pending = rest;
+        for cell in row.into_iter().flatten() {
+            self.pending.push(cell);
+        }
         self.cur_x = cx.saturating_add(1);
         self.active = true;
+        self.cursor_exp_sent = Some(self.local_frame_sent.saturating_add(1));
         self.sort_pending();
     }
 
@@ -561,74 +629,78 @@ impl Predictor {
         }
         let cx = self.cur_x - 1;
         let cy = self.cur_y;
-        if let Some(last) = self.pending.last() {
-            if last.epoch == self.prediction_epoch && last.x == cx && last.y == cy {
-                self.pending.pop();
-                self.cur_x = cx;
-                self.active = true;
-                return;
+        // Fast path (insert mode only): undo last same-epoch glyph we just placed.
+        // Stock overwrite BS never undoes — it always predicts a space.
+        if !self.overwrite {
+            if let Some(last) = self.pending.last() {
+                if last.epoch == self.prediction_epoch
+                    && last.x == cx
+                    && last.y == cy
+                    && !last.unknown
+                {
+                    let only = !self.pending.iter().any(|p| {
+                        p.y == cy && p.x > cx && p.epoch == self.prediction_epoch
+                    });
+                    if only {
+                        self.pending.pop();
+                        self.cur_x = cx;
+                        self.active = true;
+                        self.cursor_exp_sent =
+                            Some(self.local_frame_sent.saturating_add(1));
+                        return;
+                    }
+                }
             }
         }
         // Overwrite-mode BS: stock clears cell to space (no row shift).
         if self.overwrite {
             let orig = fb.cell_at(cx, cy).map(|c| c.ch).unwrap_or(' ');
-            // Remove any pending at this cell, then place space.
             self.pending.retain(|p| !(p.y == cy && p.x == cx));
             self.pending.push(self.make_pred(' ', cx, cy, orig, false));
             self.cur_x = cx;
             self.active = true;
+            self.cursor_exp_sent = Some(self.local_frame_sent.saturating_add(1));
             self.sort_pending();
             return;
         }
-        // Shift own pending on this row (any epoch; insert BS among local preds).
-        let mut next = Vec::with_capacity(self.pending.len().max(fb.cols));
-        let mut had_own = false;
-        for p in self.pending.drain(..) {
-            if p.y != cy {
-                next.push(p);
-                continue;
-            }
-            if p.x < cx {
-                next.push(p);
-            } else if p.x > cx {
-                next.push(Prediction { x: p.x - 1, ..p });
-                had_own = true;
-            } else {
-                had_own = true; // deleted at cx
-            }
-        }
-        self.cur_x = cx;
-        if had_own {
-            self.pending = next;
-            self.sort_pending();
-            self.active = true;
-            return;
-        }
-        // Host-row insert BS: predict shifted host tail until last non-blank
-        // (stock shifts whole row; we stop at trailing blanks to avoid O(cols)
-        // space preds that stall Confirm forever).
-        self.pending = next;
+
+        // Stock insert-mode BS: for i from cursor to width-1, if i+2 < width copy
+        // from i+1 else mark unknown. That makes the *last two* columns unknown
+        // (penultimate never receives former last glyph) — match stock exactly.
         let exp = self.local_frame_sent.saturating_add(1);
         let ep = self.prediction_epoch;
         let now = Instant::now();
-        let mut last_content = cx;
-        for x in (cx..fb.cols).rev() {
-            if let Some(c) = fb.cell_at(x, cy) {
-                if c.ch != ' ' && c.ch != '\0' {
-                    last_content = x;
-                    break;
-                }
+        let width = fb.cols;
+
+        let mut row: Vec<Option<Prediction>> = vec![None; width];
+        let mut rest = Vec::with_capacity(self.pending.len());
+        for p in self.pending.drain(..) {
+            if p.y == cy && p.x < width {
+                let x = p.x;
+                row[x] = Some(p);
+            } else {
+                rest.push(p);
             }
         }
-        // Shift content from cx..last_content; write space at the old last content cell.
-        if last_content >= cx {
-            for x in cx..last_content {
-                let src = fb.cell_at(x + 1, cy);
-                let ch = src
-                    .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
-                    .unwrap_or(' ');
-                let orig = fb.cell_at(x, cy).map(|c| c.ch).unwrap_or(' ');
-                self.pending.push(Prediction {
+
+        let mut new_row: Vec<Option<Prediction>> = vec![None; width];
+        for x in cx..width {
+            let orig = fb.cell_at(x, cy).map(|c| c.ch).unwrap_or(' ');
+            if x + 2 < width {
+                let (ch, unknown) = if let Some(next) = row[x + 1].as_ref() {
+                    if next.unknown {
+                        (' ', true)
+                    } else {
+                        (next.ch, false)
+                    }
+                } else {
+                    let src = fb.cell_at(x + 1, cy);
+                    let ch = src
+                        .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
+                        .unwrap_or(' ');
+                    (ch, false)
+                };
+                new_row[x] = Some(Prediction {
                     ch,
                     x,
                     y: cy,
@@ -636,24 +708,37 @@ impl Predictor {
                     at: now,
                     expiration_sent: exp,
                     original_ch: orig,
-                    unknown: x + 1 >= fb.cols.saturating_sub(1),
+                    unknown,
+                    overlay_attr: None,
+                });
+            } else {
+                // Stock: last two columns are unknown after insert-mode BS.
+                new_row[x] = Some(Prediction {
+                    ch: ' ',
+                    x,
+                    y: cy,
+                    epoch: ep,
+                    at: now,
+                    expiration_sent: exp,
+                    original_ch: orig,
+                    unknown: true,
                     overlay_attr: None,
                 });
             }
-            self.pending.push(Prediction {
-                ch: ' ',
-                x: last_content,
-                y: cy,
-                epoch: ep,
-                at: now,
-                expiration_sent: exp,
-                original_ch: fb.cell_at(last_content, cy).map(|c| c.ch).unwrap_or(' '),
-                unknown: true,
-                overlay_attr: None,
-            });
         }
-        self.sort_pending();
+        // Keep columns left of cx unchanged from prior row map.
+        for x in 0..cx {
+            new_row[x] = row[x].take();
+        }
+
+        self.pending = rest;
+        for cell in new_row.into_iter().flatten() {
+            self.pending.push(cell);
+        }
+        self.cur_x = cx;
         self.active = true;
+        self.cursor_exp_sent = Some(self.local_frame_sent.saturating_add(1));
+        self.sort_pending();
     }
 
     /// Stock become_tentative: bump prediction_epoch only.
@@ -662,37 +747,39 @@ impl Predictor {
         self.prediction_epoch = self.prediction_epoch.wrapping_add(1);
     }
 
-    /// Kill all pending in a failed tentative epoch (stock kill_epoch).
+    /// Kill pending in a failed tentative band (stock kill_epoch).
+    /// Stock removes every cell with `tentative(epoch - 1)` i.e. epoch ≥ failed,
+    /// snaps cursor to host, then become_tentative.
+    ///
+    /// Do **not** invent a sticky `cursor_exp_sent` when no real cursor prediction
+    /// remains — that freezes `set_cursor` and Adaptive demote until a future ack.
     fn kill_epoch(&mut self, epoch: u64, fb: &Framebuffer) {
-        self.pending.retain(|p| p.epoch != epoch);
-        if self.prediction_epoch == epoch {
-            self.prediction_epoch = self.prediction_epoch.wrapping_add(1);
-        }
+        self.pending.retain(|p| p.epoch < epoch);
+        self.cur_x = fb.cur_x;
+        self.cur_y = fb.cur_y;
+        self.become_tentative();
         if self.pending.is_empty() {
             self.active = false;
-            self.glitch_trigger = 0;
             self.cursor_exp_sent = None;
-            self.cur_x = fb.cur_x;
-            self.cur_y = fb.cur_y;
         } else {
-            // Stock re-tentatives remaining work after a failed band.
-            self.become_tentative();
+            // Older proven-band cells may remain; keep active for them.
+            self.active = true;
+            // Drop synthetic cursor expiry from the failed band.
+            self.cursor_exp_sent = None;
         }
     }
 
     /// Full reset (resize, demote, huge paste, screen clear).
+    /// Stock: clear overlays/cursors then become_tentative only — does **not**
+    /// re-align `confirmed_epoch`, and does **not** clear glitch_trigger.
     pub fn reset(&mut self) {
         self.pending.clear();
-        self.prediction_epoch = self.prediction_epoch.wrapping_add(1);
-        // Re-align confidence so typing after reset is immediately visible
-        // (unlike become_tentative, which intentionally re-proves).
-        self.confirmed_epoch = self.prediction_epoch;
+        self.become_tentative();
         self.active = false;
         self.confirmed = 0;
-        self.glitch_trigger = 0;
+        // Stock reset does not zero glitch_trigger / last_quick_confirmation.
         self.esc_buf.clear();
         self.cursor_exp_sent = None;
-        self.last_quick_confirmation = None;
     }
 
     /// mosh-go `SetCursor` — only tracks server cursor when inactive.
@@ -710,6 +797,14 @@ impl Predictor {
     /// Stable L→R, top→bottom order for Confirm (after mid-line insert/BS).
     fn sort_pending(&mut self) {
         self.pending.sort_by(|a, b| (a.y, a.x).cmp(&(b.y, b.x)));
+    }
+
+    /// Drop cursor-only prediction latch and snap to host.
+    fn clear_cursor_prediction(&mut self, fb: &Framebuffer) {
+        self.active = false;
+        self.cursor_exp_sent = None;
+        self.cur_x = fb.cur_x;
+        self.cur_y = fb.cur_y;
     }
 
     fn make_pred(
@@ -763,14 +858,10 @@ impl Predictor {
             false
         });
         if self.pending.len() != before && self.pending.is_empty() {
-            // Cell preds gone — drop cursor-only state too (no cells to hold).
-            if self.cursor_exp_sent.is_none() {
-                self.active = false;
-            } else {
-                // Keep glass cursor until confirm resolves cursor_exp.
-            }
-            // Do not leave glitch latch on after preds are gone.
-            self.glitch_trigger = 0;
+            // Wall-clock expire of all cells: drop active + cursor latch.
+            // (Frame-Pending cells are kept above, so this is true abandonment.)
+            self.active = false;
+            self.cursor_exp_sent = None;
         }
     }
 
@@ -779,6 +870,17 @@ impl Predictor {
     pub fn backdate_oldest_for_test(&mut self, ago: Duration) {
         if let Some(p) = self.pending.first_mut() {
             p.at = Instant::now().checked_sub(ago).unwrap_or_else(Instant::now);
+        }
+    }
+
+    /// Test helper: backdate every pending prediction (full-row insert shares time).
+    #[cfg(test)]
+    pub fn backdate_all_for_test(&mut self, ago: Duration) {
+        let t = Instant::now()
+            .checked_sub(ago)
+            .unwrap_or_else(Instant::now);
+        for p in &mut self.pending {
+            p.at = t;
         }
     }
 
@@ -817,7 +919,6 @@ impl Predictor {
     /// Confirm against host FB with stock Pending (frame-ack) semantics.
     pub fn confirm(&mut self, fb: &Framebuffer) {
         if self.pending.is_empty() {
-            self.glitch_trigger = 0;
             // Cursor-only predictions (arrows / CR) must survive until frame ack.
             if let Some(exp) = self.cursor_exp_sent {
                 if self.local_frame_sent == 0 || self.late_ack() >= exp {
@@ -832,18 +933,13 @@ impl Predictor {
                         self.cur_x = fb.cur_x;
                         self.cur_y = fb.cur_y;
                     } else {
-                        self.active = false;
-                        self.cursor_exp_sent = None;
-                        self.cur_x = fb.cur_x;
-                        self.cur_y = fb.cur_y;
+                        self.clear_cursor_prediction(fb);
                     }
                 }
                 // else still Pending: keep predicted cursor + active
                 return;
             }
-            self.active = false;
-            self.cur_x = fb.cur_x;
-            self.cur_y = fb.cur_y;
+            self.clear_cursor_prediction(fb);
             return;
         }
         if !self.active {
@@ -852,15 +948,18 @@ impl Predictor {
             return;
         }
 
-        let mut confirmed = 0usize;
+        // Stock cull walks every cell independently: Pending is *skipped*, not a
+        // hard stop. Overwrite mid-line retype can leave higher expiration_sent
+        // at a lower column — break-on-Pending would strand later Correct cells.
+        let mut remove: Vec<usize> = Vec::new();
         let mut quick = false;
-        while confirmed < self.pending.len() {
-            let pred = &self.pending[confirmed];
-            // Frame not yet acked — stock Pending: stop, do not diverge.
-            // When frame watermarks were never set (unit tests / early session),
-            // skip Pending and allow content confirm.
+        let mut i = 0usize;
+        while i < self.pending.len() {
+            let pred = &self.pending[i];
+            // Framed Pending: skip this cell, keep checking others.
             if self.local_frame_sent > 0 && self.late_ack() < pred.expiration_sent {
-                break;
+                i += 1;
+                continue;
             }
             let pred_epoch = pred.epoch;
             let pred_x = pred.x;
@@ -869,11 +968,11 @@ impl Predictor {
             let pred_at = pred.at;
             let pred_original = pred.original_ch;
             let pred_unknown = pred.unknown;
-            let _ = pred.expiration_sent;
 
             let Some(cell) = fb.cell_at(pred_x, pred_y) else {
-                if confirmed > 0 {
-                    self.pending.drain(..confirmed);
+                // Drop already-matched cells, then kill/reset on this one.
+                for &ri in remove.iter().rev() {
+                    self.pending.remove(ri);
                 }
                 if pred_epoch > self.confirmed_epoch {
                     self.kill_epoch(pred_epoch, fb);
@@ -884,40 +983,38 @@ impl Predictor {
                 }
                 return;
             };
+            // Stock get_validity after Pending:
+            // unknown → CorrectNoCredit; blank replacement → CorrectNoCredit;
+            // contents match → Correct or CorrectNoCredit; else IncorrectOrExpired.
+            if pred_unknown || is_blank_ch(pred_ch) {
+                remove.push(i);
+                i += 1;
+                continue;
+            }
             if cell.ch == pred_ch {
-                if pred_ch == ' ' && is_default_blank(cell) && fb.cur_x <= pred_x {
-                    break;
-                }
-                if Instant::now().saturating_duration_since(pred_at) < GLITCH_THRESHOLD {
-                    quick = true;
-                }
-                // Stock CorrectNoCredit: no-op / blank / unknown do not prove a band.
-                let no_credit = pred_unknown
-                    || pred_ch == ' '
-                    || is_default_blank(cell)
-                    || pred_ch == pred_original;
-                if !no_credit && pred_epoch > self.confirmed_epoch {
-                    self.confirmed_epoch = pred_epoch;
-                }
-                // Stock Correct: copy host cell renditions onto remaining same-row preds.
+                let no_credit = is_default_blank(cell) || pred_ch == pred_original;
                 if !no_credit {
+                    if Instant::now().saturating_duration_since(pred_at) < GLITCH_THRESHOLD {
+                        quick = true;
+                    }
+                    if pred_epoch > self.confirmed_epoch {
+                        self.confirmed_epoch = pred_epoch;
+                    }
                     let host_attr = cell.attr;
-                    for p in self.pending.iter_mut().skip(confirmed) {
+                    for p in self.pending.iter_mut().skip(i) {
                         if p.y == pred_y {
                             p.overlay_attr = Some(host_attr);
                         }
                     }
                 }
-                confirmed += 1;
-            } else if pred_unknown {
-                // Stock unknown → CorrectNoCredit: drop without diverge.
-                confirmed += 1;
-            } else if (cell.ch == ' ' || cell.ch == '\0') && pred_ch != ' ' {
+                remove.push(i);
+                i += 1;
+            } else if (cell.ch == ' ' || cell.ch == '\0') && self.local_frame_sent == 0 {
+                // Unframed: stall this cell (and later) like still waiting.
                 break;
             } else if pred_epoch > self.confirmed_epoch {
-                // Drain already-matched prefix, then kill failed tentative epoch.
-                if confirmed > 0 {
-                    self.pending.drain(..confirmed);
+                for &ri in remove.iter().rev() {
+                    self.pending.remove(ri);
                 }
                 self.kill_epoch(pred_epoch, fb);
                 return;
@@ -929,9 +1026,12 @@ impl Predictor {
             }
         }
 
-        if confirmed > 0 {
-            self.pending.drain(..confirmed);
-            self.confirmed = self.confirmed.saturating_add(confirmed);
+        if !remove.is_empty() {
+            let n = remove.len();
+            for &ri in remove.iter().rev() {
+                self.pending.remove(ri);
+            }
+            self.confirmed = self.confirmed.saturating_add(n);
             if quick && self.glitch_trigger > 0 {
                 let now = Instant::now();
                 let ok = self
@@ -946,76 +1046,117 @@ impl Predictor {
         }
 
         if self.pending.is_empty() {
-            self.glitch_trigger = 0;
-            // Cursor-only: if expired and host disagrees, reset; if matches, clear active.
+            // Stock does not zero glitch_trigger when pending empties; only
+            // credited Correct decrements it.
             if let Some(exp) = self.cursor_exp_sent {
                 if self.local_frame_sent == 0 || self.late_ack() >= exp {
                     if fb.cur_x == self.cur_x && fb.cur_y == self.cur_y {
-                        self.active = false;
-                        self.cursor_exp_sent = None;
-                        self.cur_x = fb.cur_x;
-                        self.cur_y = fb.cur_y;
+                        self.clear_cursor_prediction(fb);
                     } else if self.local_frame_sent > 0 {
                         // Host cursor disagrees after late_ack — stock IncorrectOrExpired.
                         self.reset();
                         self.cur_x = fb.cur_x;
                         self.cur_y = fb.cur_y;
                     } else {
-                        self.active = false;
-                        self.cur_x = fb.cur_x;
-                        self.cur_y = fb.cur_y;
+                        self.clear_cursor_prediction(fb);
                     }
                 }
             } else {
-                self.active = false;
-                self.cur_x = fb.cur_x;
-                self.cur_y = fb.cur_y;
+                self.clear_cursor_prediction(fb);
             }
         }
     }
 
-    /// Overlay predictions; underline only when flagging (stock).
+    /// Overlay predictions with stock `ConditionalOverlayCell::apply` rules.
     /// Tentative preds (epoch > confirmed_epoch) are hidden until proven.
     pub fn overlay(&self, fb: &mut Framebuffer) {
         if !self.active || !self.show {
             return;
         }
+        let mut any_visible = false;
+        let fb_cols = fb.cols;
         for pred in &self.pending {
             // Stock: if tentative(confirmed_epoch) skip
             if pred.epoch > self.confirmed_epoch {
                 continue;
             }
+            any_visible = true;
             let left_attr = if pred.x > 0 {
                 fb.cell_at(pred.x - 1, pred.y).map(|c| c.attr)
             } else {
                 None
             };
-            // Stock unknown: underline only, never replace the host glyph.
+            let Some(cell) = fb.cell_at_mut(pred.x, pred.y) else {
+                continue;
+            };
+            // Stock blank-on-blank: force flag off (no underline).
+            let mut flag = self.flagging;
+            if is_blank_ch(pred.ch) && is_blank_ch(cell.ch) {
+                flag = false;
+            }
+            // Stock unknown: underline only (never replace glyph); skip last col.
             if pred.unknown {
-                if self.flagging {
-                    if let Some(cell) = fb.cell_at_mut(pred.x, pred.y) {
-                        cell.attr.under = true;
-                    }
+                if flag && pred.x + 1 < fb_cols {
+                    cell.attr.under = true;
                 }
                 continue;
             }
-            if let Some(cell) = fb.cell_at_mut(pred.x, pred.y) {
+            // Build replacement attrs (without forced underline yet).
+            let mut rep_attr = if let Some(attr) = pred.overlay_attr {
+                attr
+            } else if let Some(attr) = left_attr {
+                attr
+            } else {
+                cell.attr
+            };
+            // Preserve host under only if we're not about to set flag under.
+            rep_attr.under = cell.attr.under && !flag;
+
+            // Stock: only write when cell differs from replacement; then flag under.
+            let same = cell.ch == pred.ch
+                && cell.width == 1
+                && attr_eq_ignoring_under(&cell.attr, &rep_attr);
+            if !same {
                 cell.ch = pred.ch;
                 cell.width = 1;
-                // Prefer Correct-cascaded host renditions; else inherit left cell.
-                if let Some(attr) = pred.overlay_attr {
-                    cell.attr = attr;
-                } else if let Some(attr) = left_attr {
-                    cell.attr = attr;
+                cell.attr = rep_attr;
+                if flag {
+                    cell.attr.under = true;
                 }
-                // Flagging underlines predictions (overrides inherited under).
-                cell.attr.under = self.flagging;
             }
         }
-        if !self.pending.is_empty() || self.active {
+        // Stock ConditionalCursorMove::apply: skip tentative cursors.
+        // Never use any_visible as a shortcut — CR/wrap from a newer tentative
+        // epoch must not move the glass while older cells are still shown.
+        let _ = any_visible;
+        if self.active && self.prediction_epoch <= self.confirmed_epoch {
             fb.cur_x = self.cur_x.min(fb.cols.saturating_sub(1));
             fb.cur_y = self.cur_y.min(fb.rows.saturating_sub(1));
         }
+    }
+
+    /// Test helper: simulate a credited Correct that proves the current band
+    /// (sets confirmed_epoch = prediction_epoch) without draining pending.
+    #[cfg(test)]
+    pub fn prove_band_for_test(&mut self) {
+        self.confirmed_epoch = self.prediction_epoch;
+    }
+
+    /// Test helper: known (non-unknown) pending glyph at (x,y), if any.
+    #[cfg(test)]
+    pub fn pending_known_char_at(&self, x: usize, y: usize) -> Option<char> {
+        self.pending
+            .iter()
+            .find(|p| p.x == x && p.y == y && !p.unknown)
+            .map(|p| p.ch)
+    }
+
+    /// Test helper: whether any pending cell is marked unknown at (x,y).
+    #[cfg(test)]
+    pub fn pending_unknown_at(&self, x: usize, y: usize) -> bool {
+        self.pending
+            .iter()
+            .any(|p| p.x == x && p.y == y && p.unknown)
     }
 }
 
@@ -1062,14 +1203,32 @@ fn is_print(ch: char) -> bool {
     !ch.is_control()
 }
 
-fn is_default_blank(cell: &crate::framebuffer::Cell) -> bool {
-    (cell.ch == ' ' || cell.ch == '\0') && cell.attr == crate::framebuffer::Attr::default()
+fn is_blank_ch(ch: char) -> bool {
+    ch == ' ' || ch == '\0'
 }
 
-/// True if stream contains geometry-breaking ops that invalidate pending
-/// cell coordinates (erase, insert/delete chars/lines, ECH).
-fn hoststring_is_destructive_clear(data: &[u8]) -> bool {
-    // CSI J/K (ED/EL), @/P (ICH/DCH), L/M (IL/DL), X (ECH).
+fn is_default_blank(cell: &crate::framebuffer::Cell) -> bool {
+    is_blank_ch(cell.ch) && cell.attr == crate::framebuffer::Attr::default()
+}
+
+fn attr_eq_ignoring_under(a: &crate::framebuffer::Attr, b: &crate::framebuffer::Attr) -> bool {
+    a.bold == b.bold
+        && a.dim == b.dim
+        && a.italic == b.italic
+        && a.blink == b.blink
+        && a.reverse == b.reverse
+        && a.strike == b.strike
+        && a.fg == b.fg
+        && a.bg == b.bg
+}
+
+/// True if stream contains **geometry** ops that invalidate pending cell (x,y).
+///
+/// Do **not** treat EL/ICH/DCH/ECH as hard reset — stock confirms against the
+/// final cell grid after those redraws (readline often uses CUP+EL+reprint that
+/// still matches predictions). Line insert/delete and full ED change layout.
+fn hoststring_is_geometry_break(data: &[u8]) -> bool {
+    // CSI L/M (IL/DL), J (ED — region/full erase rewrites layout).
     let mut i = 0;
     while i + 1 < data.len() {
         if data[i] == 0x1b && data[i + 1] == b'[' {
@@ -1077,7 +1236,7 @@ fn hoststring_is_destructive_clear(data: &[u8]) -> bool {
             while j < data.len() {
                 let c = data[j];
                 j += 1;
-                if matches!(c, b'J' | b'K' | b'@' | b'P' | b'L' | b'M' | b'X') {
+                if matches!(c, b'L' | b'M' | b'J') {
                     return true;
                 }
                 if (b'@'..=b'~').contains(&c) {
@@ -1170,19 +1329,50 @@ impl DisplayPipeline {
     }
 
     /// Feed SSP sent / early-ack / late-ack (echo_ack) into the predictor.
-    pub fn set_frames(&mut self, sent: u64, early_acked: u64, late_acked: u64) {
+    ///
+    /// When late_ack advances with **no** accompanying HostBytes, stock still
+    /// culls Pending predictions. Returns Diff paint if overlay must update.
+    pub fn set_frames(&mut self, sent: u64, early_acked: u64, late_acked: u64) -> Vec<u8> {
+        let before_pending = self.predictor.pending_len();
+        let before_active = self.predictor.active();
+        let before_cur = (self.predictor.cur_x(), self.predictor.cur_y());
         self.predictor.set_frames(sent, early_acked, late_acked);
+        // Ack-only packets never call on_host_bytes; still Confirm/Pending drain.
+        if before_pending > 0 || before_active {
+            self.predictor.confirm(&self.host_fb);
+            self.predictor.expire_stale(Instant::now());
+            let after_pending = self.predictor.pending_len();
+            let after_active = self.predictor.active();
+            let after_cur = (self.predictor.cur_x(), self.predictor.cur_y());
+            let changed = before_pending != after_pending
+                || before_active != after_active
+                || before_cur != after_cur;
+            if changed {
+                if self.predictor.should_show() {
+                    self.using_overlay_path = true;
+                    if self.last_shown.is_none() {
+                        self.last_shown = Some(self.host_fb.clone());
+                    }
+                    return self.render_overlay_path();
+                }
+                if self.using_overlay_path {
+                    self.using_overlay_path = false;
+                    return self.render_host_only();
+                }
+            }
+        }
+        Vec::new()
     }
 
     #[cfg(test)]
-    pub fn set_frames_for_test(&mut self, sent: u64, acked: u64) {
+    pub fn set_frames_for_test(&mut self, sent: u64, acked: u64) -> Vec<u8> {
         // Tests without separate echo_ack: advance late with early.
-        self.set_frames(sent, acked, acked);
+        self.set_frames(sent, acked, acked)
     }
 
     #[cfg(test)]
-    pub fn set_frames_late_for_test(&mut self, sent: u64, early: u64, late: u64) {
-        self.set_frames(sent, early, late);
+    pub fn set_frames_late_for_test(&mut self, sent: u64, early: u64, late: u64) -> Vec<u8> {
+        self.set_frames(sent, early, late)
     }
 
     /// Resize local model; returns a full redraw for the PTY when size changes.
@@ -1258,10 +1448,6 @@ impl DisplayPipeline {
 
     /// HostBytes (or raw hoststring) arrived from mosh-server.
     pub fn on_host_bytes(&mut self, hoststring: &[u8]) -> Vec<u8> {
-        // Bottom-row LF scrolls the host model without remapping pending y.
-        let may_scroll = hoststring.contains(&b'\n')
-            && self.host_fb.cur_y + 1 >= self.host_fb.rows
-            && self.predictor.pending_len() > 0;
         // Structural scan must see sticky carry + this chunk (same reassembly
         // apply_ansi uses); otherwise split CSI like "\x1b[2" + "@" misses ICH.
         let structural_scan: Vec<u8> = if self.pen.carry.is_empty() {
@@ -1271,10 +1457,13 @@ impl DisplayPipeline {
             v.extend_from_slice(hoststring);
             v
         };
-        let structural = hoststring_is_destructive_clear(&structural_scan);
+        let geometry = hoststring_is_geometry_break(&structural_scan);
+        let gen_before = self.host_fb.scroll_generation;
         crate::ansi_apply::apply_ansi_with_pen(&mut self.host_fb, &mut self.pen, hoststring);
-        // Geometry-breaking ops wipe pending (coords no longer match cells).
-        if structural || may_scroll {
+        // Line geometry + any host scroll wipe pending. Content redraws
+        // (EL/ICH/DCH/ECH) go through Confirm against the final grid instead.
+        let scrolled = self.host_fb.scroll_generation != gen_before;
+        if geometry || scrolled {
             self.predictor.reset();
         }
         self.predictor
@@ -1347,6 +1536,12 @@ impl DisplayPipeline {
     #[cfg(test)]
     pub fn predictor_mut_for_test(&mut self) -> &mut Predictor {
         &mut self.predictor
+    }
+
+    /// Test helper: prove current prediction band (stock credited Correct).
+    #[cfg(test)]
+    pub fn prove_band_for_test(&mut self) {
+        self.predictor.prove_band_for_test();
     }
 }
 

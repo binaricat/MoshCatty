@@ -88,6 +88,8 @@ pub struct Framebuffer {
     pub cursor_visible: bool,
     /// Stock DrawState `next_print_will_wrap` — last-col print defers wrap to next char.
     pub next_print_will_wrap: bool,
+    /// Incremented on scroll_up / full clear so prediction can invalidate coords.
+    pub scroll_generation: u64,
 }
 
 impl Framebuffer {
@@ -102,6 +104,7 @@ impl Framebuffer {
             cur_y: 0,
             cursor_visible: true,
             next_print_will_wrap: false,
+            scroll_generation: 0,
         }
     }
 
@@ -111,6 +114,7 @@ impl Framebuffer {
         if cols == self.cols && rows == self.rows {
             return;
         }
+        let gen = self.scroll_generation;
         let mut next = Self::new(cols, rows);
         let copy_cols = self.cols.min(cols);
         let copy_rows = self.rows.min(rows);
@@ -125,6 +129,7 @@ impl Framebuffer {
         next.cur_y = self.cur_y.min(rows.saturating_sub(1));
         next.cursor_visible = self.cursor_visible;
         next.next_print_will_wrap = false;
+        next.scroll_generation = gen.wrapping_add(1);
         *self = next;
     }
 

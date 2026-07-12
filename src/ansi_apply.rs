@@ -131,6 +131,7 @@ fn scroll_up(fb: &mut Framebuffer, lines: usize) {
     }
     let cols = fb.cols;
     let rows = fb.rows;
+    fb.scroll_generation = fb.scroll_generation.wrapping_add(1);
     if lines >= rows {
         for c in fb.cells.iter_mut() {
             *c = Default::default();

@@ -117,26 +117,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             stdout.write_all(&mode_paint)?;
             stdout.flush()?;
         }
-        // Stock prediction: sent/early-ack (transport) + late-ack (echo_ack).
-        display.set_frames(
-            client.sent_num(),
-            client.acked_by_remote(),
-            client.echo_ack(),
-        );
 
+        // Poll first so host_fb is updated before late_ack Confirm.
+        // Same-batch hoststring + echo_ack must not confirm against a stale FB
+        // (that IncorrectOrExpires blank preds and permanently hides local echo).
         let host_paint = client.poll()?;
         if !host_paint.is_empty() {
-            // Refresh acks after poll (may have advanced).
-            display.set_frames(
-                client.sent_num(),
-                client.acked_by_remote(),
-                client.echo_ack(),
-            );
             let out = display.on_host_bytes(&host_paint);
             if !out.is_empty() {
                 stdout.write_all(&out)?;
                 stdout.flush()?;
             }
+        }
+        // After host apply (or ack-only empty poll): advance frames + Confirm.
+        let ack_paint = display.set_frames(
+            client.sent_num(),
+            client.acked_by_remote(),
+            client.echo_ack(),
+        );
+        if !ack_paint.is_empty() {
+            stdout.write_all(&ack_paint)?;
+            stdout.flush()?;
         }
 
         // mosh-go ExpireStale: tick even when the server is quiet.

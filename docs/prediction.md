@@ -33,12 +33,13 @@ Never require terminfo / Cygwin / system mosh. Pure Rust standalone binary only.
 | Host scroll / IL/DL / ED | wipe pending (`scroll_generation` / geometry CSI) |
 | Always | forces show, not flagging |
 | Adaptive | hold show while pending or cursor Pending |
+| Experimental | show immediately; discard only a failed cell instead of its prediction band |
 
 ## Env
 
 | Variable | Values |
 |----------|--------|
-| `MOSH_PREDICTION_DISPLAY` | `adaptive` (default) / `always` / `never` |
+| `MOSH_PREDICTION_DISPLAY` | `adaptive` (default) / `always` / `never` / `experimental` |
 | `MOSH_PREDICTION_OVERWRITE` | `yes`/`true`/`1` → overwrite instead of insert |
 
 ## Explicit non-goals (preserve MoshCatty advantages)

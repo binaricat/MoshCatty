@@ -5,17 +5,20 @@
 //! Netcatty's node-pty sandwich and eliminates the Cygwin terminfo path.
 
 use std::collections::VecDeque;
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
+use quinn_udp::EcnCodepoint;
+
 use crate::crypto::Ocb;
+use crate::ecn::EcnSocket;
 use crate::error::{Error, Result};
 use crate::pb::UserInstruction;
 use crate::terminal::TerminalView;
 use crate::transport::Transport;
 
 const TICK_INTERVAL: Duration = Duration::from_millis(8);
-const MAX_PAYLOAD: usize = 16384;
+const MAX_DATAGRAM_SIZE: usize = 2048;
 /// Stock mosh only times out the initial attachment; an established session
 /// remains resumable across long network outages.
 const INITIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -44,7 +47,8 @@ fn is_message_too_long(error: &std::io::Error) -> bool {
 
 /// A connected mosh client session.
 pub struct Client {
-    sockets: VecDeque<UdpSocket>,
+    sockets: VecDeque<EcnSocket>,
+    receive_buffer: Vec<u8>,
     remote_addr: SocketAddr,
     last_port_choice: Instant,
     transport: Transport,
@@ -77,6 +81,7 @@ impl Client {
             .ok_or_else(|| Error::Other(format!("could not resolve {host}:{port}")))?;
 
         let socket = Self::open_socket(addr)?;
+        let receive_buffer = vec![0; socket.receive_buffer_size(MAX_DATAGRAM_SIZE)];
 
         let mut transport = Transport::new_client(ocb);
         if addr.is_ipv6() {
@@ -85,6 +90,7 @@ impl Client {
         transport.force_next_send();
         let mut client = Self {
             sockets: VecDeque::from([socket]),
+            receive_buffer,
             remote_addr: addr,
             last_port_choice: Instant::now(),
             transport,
@@ -191,27 +197,33 @@ impl Client {
         }
 
         let mut paint = Vec::new();
-        let mut buf = [0u8; MAX_PAYLOAD + 64];
+        let buf = &mut self.receive_buffer;
         let mut received_datagram = false;
         for socket in &self.sockets {
             loop {
-                match socket.recv(&mut buf) {
-                    Ok(n) => {
+                match socket.recv(buf) {
+                    Ok(datagrams) => {
                         received_datagram = true;
-                        if let Some(state) = self.transport.recv_state(&buf[..n]) {
-                            let chunk = match self.terminal.apply_host_state(
-                                state.old_num,
-                                state.new_num,
-                                state.throwaway_num,
-                                &state.diff,
+                        for datagram in datagrams {
+                            let end = datagram.offset + datagram.len;
+                            if let Some(state) = self.transport.recv_state_with_congestion(
+                                &buf[datagram.offset..end],
+                                datagram.ecn == Some(EcnCodepoint::Ce),
                             ) {
-                                Ok(chunk) => chunk,
-                                Err(error) => {
-                                    self.mark_dead("remote terminal state was rejected");
-                                    return Err(error);
-                                }
-                            };
-                            paint.extend_from_slice(&chunk);
+                                let chunk = match self.terminal.apply_host_state(
+                                    state.old_num,
+                                    state.new_num,
+                                    state.throwaway_num,
+                                    &state.diff,
+                                ) {
+                                    Ok(chunk) => chunk,
+                                    Err(error) => {
+                                        self.mark_dead("remote terminal state was rejected");
+                                        return Err(error);
+                                    }
+                                };
+                                paint.extend_from_slice(&chunk);
+                            }
                         }
                     }
                     Err(error)
@@ -279,15 +291,8 @@ impl Client {
         self.dead_reason = Some(reason.to_string());
     }
 
-    fn open_socket(addr: SocketAddr) -> Result<UdpSocket> {
-        let socket = UdpSocket::bind(if addr.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        })?;
-        socket.connect(addr)?;
-        socket.set_nonblocking(true)?;
-        Ok(socket)
+    fn open_socket(addr: SocketAddr) -> Result<EcnSocket> {
+        Ok(EcnSocket::bind(addr)?)
     }
 
     fn maybe_hop_port(&mut self) {
@@ -302,6 +307,10 @@ impl Client {
         let Ok(socket) = Self::open_socket(self.remote_addr) else {
             return;
         };
+        let required = socket.receive_buffer_size(MAX_DATAGRAM_SIZE);
+        if self.receive_buffer.len() < required {
+            self.receive_buffer.resize(required, 0);
+        }
         self.sockets.push_back(socket);
         while self.sockets.len() > MAX_PORTS_OPEN {
             self.sockets.pop_front();

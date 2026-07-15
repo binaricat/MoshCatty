@@ -1,8 +1,8 @@
 //! State Synchronization Protocol (SSP) transport for Mosh.
 //!
 //! Matches upstream mobile-shell/mosh framing (zlib TransportInstruction inside
-//! fragments, OCB-sealed datagrams) with mosh-go's simplified single-pending
-//! send queue. Critical fixes vs early draft:
+//! fragments, OCB-sealed datagrams) with a bounded multi-state send queue.
+//! Critical fixes vs early draft:
 //! - accept out-of-order crypto seq (upstream returns payload; only true
 //!   replays of seen seq are dropped)
 //! - emit throwaway_num so the peer can prune received states
@@ -30,7 +30,9 @@ const INITIAL_RTO: Duration = Duration::from_millis(500);
 const MIN_RTO: Duration = Duration::from_millis(50);
 const MAX_RTO: Duration = Duration::from_millis(1000);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
+const ACK_DELAY: Duration = Duration::from_millis(100);
 const ACTIVE_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
+const CONGESTION_TIMESTAMP_PENALTY_MS: u16 = 500;
 const SHUTDOWN_RETRIES: u8 = 16;
 const SENT_STATE_CAP: usize = 32;
 const OCB_BLOCK_LIMIT: u64 = 1u64 << 47;
@@ -76,6 +78,7 @@ pub struct Transport {
     pacing_enabled: bool,
     allow_immediate_new_state: bool,
     pending_data_ack: bool,
+    pending_ack_since: Option<Instant>,
 
     /// Oldest local state we still need the peer to retain (throwaway watermark).
     local_throwaway: u64,
@@ -145,6 +148,7 @@ impl Transport {
             pacing_enabled: !is_server,
             allow_immediate_new_state: true,
             pending_data_ack: false,
+            pending_ack_since: None,
             local_throwaway: 0,
             received_nums: vec![0],
             ack_num: 0,
@@ -295,7 +299,7 @@ impl Transport {
     /// Produce outgoing wire datagrams if it's time to send.
     pub fn tick(&mut self) -> Vec<Vec<u8>> {
         let now = Instant::now();
-        let need_ack = self.ack_num > self.sent_ack_num;
+        let ack_changed = self.ack_num > self.sent_ack_num;
         // Multiple input batches can arrive inside one pacing interval. Only
         // the newest unsent state matters because it contains the cumulative
         // diff from the same acknowledged base; sending stale unsent states
@@ -318,14 +322,26 @@ impl Transport {
             && (!self.pacing_enabled
                 || self.allow_immediate_new_state
                 || now.duration_since(self.last_send) >= self.send_interval());
+        let retransmit_after = if now.duration_since(self.last_recv) < ACTIVE_RETRY_TIMEOUT {
+            self.rto + ACK_DELAY
+        } else {
+            HEARTBEAT_INTERVAL
+        };
         let retransmit_index = self.outbound_states.iter().rposition(|state| {
             state
                 .last_sent
-                .is_some_and(|last_sent| now.duration_since(last_sent) >= self.rto)
+                .is_some_and(|last_sent| now.duration_since(last_sent) >= retransmit_after)
         });
         let heartbeat_due = self.outbound_states.is_empty()
             && now.duration_since(self.last_send) >= HEARTBEAT_INTERVAL;
-        let urgent_ack = self.pending_data_ack;
+        let delayed_ack_due = self.pending_data_ack
+            && self
+                .pending_ack_since
+                .is_some_and(|since| now.duration_since(since) >= ACK_DELAY);
+        let periodic_ack_due =
+            ack_changed && now.duration_since(self.last_send) >= HEARTBEAT_INTERVAL;
+        let urgent_shutdown_ack = ack_changed && self.ack_num == u64::MAX;
+        let ack_due = delayed_ack_due || periodic_ack_due || urgent_shutdown_ack;
         let forced = self.force_send;
         let shutdown_due = self.shutdown_in_progress
             && !self.shutdown_acknowledged()
@@ -333,10 +349,9 @@ impl Transport {
             && (forced || now.duration_since(self.last_send) >= self.send_interval());
 
         if !(unsent_due
-            || need_ack
+            || ack_due
             || retransmit_index.is_some()
             || heartbeat_due
-            || urgent_ack
             || forced
             || shutdown_due)
         {
@@ -356,7 +371,7 @@ impl Transport {
                     (state.old_num, u64::MAX, state.diff.clone())
                 })
         } else if let Some(index) = unsent_index
-            .filter(|_| unsent_due || need_ack || urgent_ack || forced)
+            .filter(|_| unsent_due || ack_due || forced)
             .or(retransmit_index)
         {
             let state = &mut self.outbound_states[index];
@@ -377,6 +392,7 @@ impl Transport {
             (old_num, self.sent_num, Vec::new())
         };
         self.pending_data_ack = false;
+        self.pending_ack_since = None;
 
         // Do not tell the peer to discard a base still referenced by a queued
         // state that has not reached it yet.
@@ -395,7 +411,7 @@ impl Transport {
             ack_num: self.ack_num,
             throwaway_num: throwaway,
             diff,
-            chaff: vec![],
+            chaff: make_chaff(),
         };
         if self.ack_num == u64::MAX {
             self.counterparty_shutdown_ack_sent = true;
@@ -429,6 +445,14 @@ impl Transport {
     /// Process a datagram and retain the SSP numbering needed to reconstruct
     /// the peer's complete remote state.
     pub(crate) fn recv_state(&mut self, wire: &[u8]) -> Option<ReceivedStateDiff> {
+        self.recv_state_with_congestion(wire, false)
+    }
+
+    pub(crate) fn recv_state_with_congestion(
+        &mut self,
+        wire: &[u8],
+        congestion_experienced: bool,
+    ) -> Option<ReceivedStateDiff> {
         if wire.len() < MIN_DATAGRAM {
             return None;
         }
@@ -469,7 +493,11 @@ impl Transport {
             }
             // Save peer timestamp for echo (stock holds ~1s).
             if remote_ts != TS_NO_REPLY {
-                self.last_ts = Some(remote_ts);
+                self.last_ts = Some(if congestion_experienced {
+                    remote_ts.wrapping_sub(CONGESTION_TIMESTAMP_PENALTY_MS)
+                } else {
+                    remote_ts
+                });
                 self.last_ts_at = Instant::now();
             }
             if ts_reply != TS_NO_REPLY {
@@ -547,9 +575,11 @@ impl Transport {
             self.ack_num = ti.new_num;
         }
         if !ti.diff.is_empty() {
+            self.pending_ack_since.get_or_insert_with(Instant::now);
             self.pending_data_ack = true;
         }
         if ti.new_num == u64::MAX {
+            self.pending_ack_since.get_or_insert_with(Instant::now);
             self.pending_data_ack = true;
         }
         Some(ReceivedStateDiff {
@@ -645,6 +675,19 @@ fn zlib_compress(data: &[u8]) -> Vec<u8> {
     let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
     enc.write_all(data).expect("zlib write");
     enc.finish().expect("zlib finish")
+}
+
+fn make_chaff() -> Vec<u8> {
+    let mut random = [0u8; 17];
+    if getrandom::getrandom(&mut random).is_err() {
+        return Vec::new();
+    }
+    chaff_from_random(random)
+}
+
+fn chaff_from_random(random: [u8; 17]) -> Vec<u8> {
+    let len = usize::from(random[0] % 17);
+    random[1..1 + len].to_vec()
 }
 
 fn zlib_decompress(data: &[u8]) -> Option<Vec<u8>> {
@@ -868,6 +911,117 @@ mod tests {
     }
 
     #[test]
+    fn active_retransmission_includes_stock_ack_delay() {
+        let (_server, mut client) = pair();
+        client.set_pending(b"unacknowledged".to_vec());
+        client.force_next_send();
+        assert!(!client.tick().is_empty());
+
+        let state = client.outbound_states.back_mut().unwrap();
+        state.last_sent = Some(Instant::now() - client.rto - Duration::from_millis(50));
+        client.last_send = Instant::now() - client.rto - Duration::from_millis(50);
+        client.last_recv = Instant::now();
+        assert!(
+            client.tick().is_empty(),
+            "stock mosh waits RTO plus its 100 ms delayed-ACK allowance"
+        );
+
+        let state = client.outbound_states.back_mut().unwrap();
+        state.last_sent = Some(Instant::now() - client.rto - Duration::from_millis(101));
+        client.last_send = Instant::now() - client.rto - Duration::from_millis(101);
+        assert!(!client.tick().is_empty());
+    }
+
+    #[test]
+    fn unacknowledged_state_backs_off_to_three_seconds_after_ten_second_outage() {
+        let (mut server, mut client) = pair();
+        client.set_pending(b"survive outage".to_vec());
+        client.force_next_send();
+        assert!(!client.tick().is_empty());
+
+        client.last_recv = Instant::now() - Duration::from_secs(11);
+        let state = client.outbound_states.back_mut().unwrap();
+        state.last_sent = Some(Instant::now() - Duration::from_secs(2));
+        client.last_send = Instant::now() - Duration::from_secs(2);
+        assert!(
+            client.tick().is_empty(),
+            "long outage kept retransmitting faster than the stock heartbeat"
+        );
+
+        let state = client.outbound_states.back_mut().unwrap();
+        state.last_sent = Some(Instant::now() - Duration::from_secs(3));
+        client.last_send = Instant::now() - Duration::from_secs(3);
+        let retransmission = client.tick();
+        let diff = retransmission
+            .iter()
+            .find_map(|datagram| server.recv(datagram))
+            .expect("three-second outage retry should carry the pending state");
+        assert_eq!(diff, b"survive outage");
+    }
+
+    #[test]
+    fn nonempty_remote_state_uses_stock_delayed_ack() {
+        let (mut server, mut client) = pair();
+        server.set_pending(b"screen update".to_vec());
+        for datagram in server.tick() {
+            assert_eq!(
+                client.recv(&datagram).as_deref(),
+                Some(b"screen update".as_slice())
+            );
+        }
+
+        assert!(
+            client.tick().is_empty(),
+            "screen data was acknowledged before the 100 ms delayed-ACK window"
+        );
+        std::thread::sleep(Duration::from_millis(101));
+        let acknowledgment = client.tick();
+        assert!(!acknowledgment.is_empty());
+        for datagram in acknowledgment {
+            let _ = server.recv(&datagram);
+        }
+        assert_eq!(server.acked_by_remote(), 1);
+    }
+
+    #[test]
+    fn outgoing_input_piggybacks_ack_before_delay_expires() {
+        let (mut server, mut client) = pair();
+        server.set_pending(b"screen update".to_vec());
+        for datagram in server.tick() {
+            let _ = client.recv(&datagram);
+        }
+
+        client.set_pending(b"user input".to_vec());
+        let outgoing = client.tick();
+        assert!(!outgoing.is_empty());
+        for datagram in outgoing {
+            let _ = server.recv(&datagram);
+        }
+        assert_eq!(server.acked_by_remote(), 1);
+    }
+
+    #[test]
+    fn empty_remote_heartbeat_waits_for_local_heartbeat() {
+        let (mut server, mut client) = pair();
+        server.force_next_send();
+        for datagram in server.tick() {
+            assert_eq!(client.recv(&datagram), Some(Vec::new()));
+        }
+
+        assert!(
+            client.tick().is_empty(),
+            "an empty heartbeat triggered an immediate ping-pong acknowledgment"
+        );
+        client.last_send = Instant::now() - Duration::from_secs(3);
+        let acknowledgment = client.tick();
+        assert!(!acknowledgment.is_empty());
+        for datagram in acknowledgment {
+            let _ = server.recv(&datagram);
+        }
+        assert_eq!(server.acked_by_remote(), 1);
+    }
+
+    #[test]
     fn each_wire_instruction_uses_a_fresh_fragment_id() {
         let (_server, mut client) = pair();
         client.force_next_send();
@@ -918,6 +1072,38 @@ mod tests {
             measured < Duration::from_millis(60),
             "peer hold time leaked into RTT: {measured:?}"
         );
+    }
+
+    #[test]
+    fn congestion_notification_adds_stock_timestamp_penalty() {
+        let (mut server, mut client) = pair();
+        server.force_next_send();
+        for datagram in server.tick() {
+            let _ = client.recv_state_with_congestion(&datagram, true);
+        }
+
+        client.force_next_send();
+        for datagram in client.tick() {
+            let _ = server.recv(&datagram);
+        }
+
+        let measured = server
+            .srtt()
+            .expect("ECN reply should produce an RTT sample");
+        assert!(
+            (Duration::from_millis(450)..Duration::from_millis(650)).contains(&measured),
+            "stock 500 ms congestion penalty missing from echoed timestamp: {measured:?}"
+        );
+    }
+
+    #[test]
+    fn stock_chaff_uses_zero_to_sixteen_random_bytes() {
+        let random = [16, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        assert_eq!(chaff_from_random(random), (0u8..16).collect::<Vec<_>>());
+
+        let mut zero = [0u8; 17];
+        zero[0] = 17;
+        assert!(chaff_from_random(zero).is_empty());
     }
 
     #[test]

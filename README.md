@@ -66,7 +66,7 @@ Peer products either skip Windows Mosh or own a private engine. MoshCatty is the
 - **Cross-platform**: Linux / macOS / Windows (no Cygwin runtime)
 - **Drop-in CLI**: `MOSH_KEY=<key> mosh-client <host> <port>`
 - **Speculative local echo** (stock overlay rules on a mosh-go Diff path):
-  host_fb → Confirm → Overlay → Diff (`MOSH_PREDICTION_DISPLAY=adaptive|always|never`).
+  host_fb → Confirm → Overlay → Diff (`MOSH_PREDICTION_DISPLAY=adaptive|always|never|experimental`).
   See `docs/prediction.md`.
 - **Library API** (`moshcatty` crate) for embedders
 - **RFC 7253** AES-128-OCB3 + mosh-go interop vectors in CI
@@ -127,6 +127,8 @@ mosh-client 192.0.2.10 60001
 | Variable | Meaning |
 |----------|---------|
 | `MOSH_KEY` | **Required.** Session key from `MOSH CONNECT` |
+| `MOSH_PREDICTION_DISPLAY` | `adaptive` (default), `always`, `never`, or `experimental` |
+| `MOSH_PREDICTION_OVERWRITE` | `yes` to predict overwrite-mode input |
 | `COLUMNS` / `LINES` | Initial / fallback terminal size |
 | (Unix) live winsize | Polled via `TIOCGWINSZ` |
 | (Windows) console size | Polled via `GetConsoleScreenBufferInfo` |

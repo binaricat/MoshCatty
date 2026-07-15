@@ -47,6 +47,7 @@ pub enum DisplayPreference {
     Always,
     Never,
     Adaptive,
+    Experimental,
 }
 
 impl DisplayPreference {
@@ -55,6 +56,7 @@ impl DisplayPreference {
             "always" | "yes" | "1" | "true" | "on" => Self::Always,
             "never" | "no" | "0" | "false" | "off" => Self::Never,
             "adaptive" | "" => Self::Adaptive,
+            "experimental" => Self::Experimental,
             _ => Self::Adaptive,
         }
     }
@@ -131,7 +133,10 @@ impl Predictor {
             preference,
             // Stock: Always forces *show*, not flagging. Flagging follows
             // send_interval hysteresis (and big glitch) in set_srtt.
-            show: matches!(preference, DisplayPreference::Always),
+            show: matches!(
+                preference,
+                DisplayPreference::Always | DisplayPreference::Experimental
+            ),
             flagging: false,
             glitch_trigger: 0,
             esc_buf: Vec::new(),
@@ -187,7 +192,7 @@ impl Predictor {
                 self.flagging = false;
                 return;
             }
-            DisplayPreference::Always => {
+            DisplayPreference::Always | DisplayPreference::Experimental => {
                 // Stock: Always only forces *display* of predictions.
                 self.show = true;
             }
@@ -281,6 +286,11 @@ impl Predictor {
         };
         let mut i = 0;
         while i < data.len() {
+            if self.preference == DisplayPreference::Experimental {
+                // Stock experimental mode makes every new prediction belong
+                // to the already-confirmed epoch, so it is visible at once.
+                self.prediction_epoch = self.confirmed_epoch;
+            }
             if data[i] == 0x1b {
                 match self.try_parse_arrow(&data[i..], fb) {
                     ArrowParse::NeedMore => {
@@ -366,8 +376,7 @@ impl Predictor {
             // (retype in overwrite must not stack duplicates for Confirm).
             self.pending.retain(|p| !(p.y == cy && p.x == cx));
             // Stock places known glyph even on last col (epoch hide covers ambiguity).
-            self.pending
-                .push(self.make_pred(ch, cx, cy, orig, false));
+            self.pending.push(self.make_pred(ch, cx, cy, orig, false));
             if at_last_col {
                 self.become_tentative();
                 self.newline_carriage_return(fb);
@@ -640,15 +649,15 @@ impl Predictor {
                     && last.y == cy
                     && !last.unknown
                 {
-                    let only = !self.pending.iter().any(|p| {
-                        p.y == cy && p.x > cx && p.epoch == self.prediction_epoch
-                    });
+                    let only = !self
+                        .pending
+                        .iter()
+                        .any(|p| p.y == cy && p.x > cx && p.epoch == self.prediction_epoch);
                     if only {
                         self.pending.pop();
                         self.cur_x = cx;
                         self.active = true;
-                        self.cursor_exp_sent =
-                            Some(self.local_frame_sent.saturating_add(1));
+                        self.cursor_exp_sent = Some(self.local_frame_sent.saturating_add(1));
                         return;
                     }
                 }
@@ -746,7 +755,9 @@ impl Predictor {
     /// Stock become_tentative: bump prediction_epoch only.
     /// Existing pending stay; those with epoch > confirmed_epoch are hidden.
     pub fn become_tentative(&mut self) {
-        self.prediction_epoch = self.prediction_epoch.wrapping_add(1);
+        if self.preference != DisplayPreference::Experimental {
+            self.prediction_epoch = self.prediction_epoch.wrapping_add(1);
+        }
     }
 
     /// Kill pending in a failed tentative band (stock kill_epoch).
@@ -878,9 +889,7 @@ impl Predictor {
     /// Test helper: backdate every pending prediction (full-row insert shares time).
     #[cfg(test)]
     pub fn backdate_all_for_test(&mut self, ago: Duration) {
-        let t = Instant::now()
-            .checked_sub(ago)
-            .unwrap_or_else(Instant::now);
+        let t = Instant::now().checked_sub(ago).unwrap_or_else(Instant::now);
         for p in &mut self.pending {
             p.at = t;
         }
@@ -929,6 +938,8 @@ impl Predictor {
                         self.cursor_exp_sent = None;
                         self.cur_x = fb.cur_x;
                         self.cur_y = fb.cur_y;
+                    } else if self.preference == DisplayPreference::Experimental {
+                        self.clear_cursor_prediction(fb);
                     } else if self.local_frame_sent > 0 {
                         // Host cursor disagrees after late_ack — stock IncorrectOrExpired.
                         self.reset();
@@ -972,6 +983,11 @@ impl Predictor {
             let pred_unknown = pred.unknown;
 
             let Some(cell) = fb.cell_at(pred_x, pred_y) else {
+                if self.preference == DisplayPreference::Experimental {
+                    remove.push(i);
+                    i += 1;
+                    continue;
+                }
                 // Drop already-matched cells, then kill/reset on this one.
                 for &ri in remove.iter().rev() {
                     self.pending.remove(ri);
@@ -1014,6 +1030,11 @@ impl Predictor {
             } else if (cell.ch == ' ' || cell.ch == '\0') && self.local_frame_sent == 0 {
                 // Unframed: stall this cell (and later) like still waiting.
                 break;
+            } else if self.preference == DisplayPreference::Experimental {
+                // Stock experimental mode discards only the bad cell and lets
+                // newer speculative cells survive independently.
+                remove.push(i);
+                i += 1;
             } else if pred_epoch > self.confirmed_epoch {
                 for &ri in remove.iter().rev() {
                     self.pending.remove(ri);
@@ -1052,7 +1073,9 @@ impl Predictor {
             // credited Correct decrements it.
             if let Some(exp) = self.cursor_exp_sent {
                 if self.local_frame_sent == 0 || self.late_ack() >= exp {
-                    if fb.cur_x == self.cur_x && fb.cur_y == self.cur_y {
+                    if (fb.cur_x == self.cur_x && fb.cur_y == self.cur_y)
+                        || self.preference == DisplayPreference::Experimental
+                    {
                         self.clear_cursor_prediction(fb);
                     } else if self.local_frame_sent > 0 {
                         // Host cursor disagrees after late_ack — stock IncorrectOrExpired.
@@ -1281,7 +1304,10 @@ impl DisplayPipeline {
             last_shown: None,
             predictor: Predictor::new(preference),
             pen: crate::ansi_apply::AnsiPen::default(),
-            using_overlay_path: matches!(preference, DisplayPreference::Always),
+            using_overlay_path: matches!(
+                preference,
+                DisplayPreference::Always | DisplayPreference::Experimental
+            ),
         }
     }
 

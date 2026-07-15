@@ -234,33 +234,28 @@ fn spawn_fake_mosh_server(
             if *done2.lock().unwrap() {
                 break;
             }
-            match sock.recv_from(&mut buf) {
-                Ok((n, addr)) => {
-                    client_addr = Some(addr);
-                    if let Some(diff) = transport.recv(&buf[..n]) {
-                        if !diff.is_empty() {
-                            let host = HostInstruction::encode_message(&[HostInstruction {
-                                hoststring: format!(
-                                    "\x1b[H\x1b[2J$ echo {marker}\r\n{marker}\r\n$ "
-                                )
-                                .into_bytes(),
-                                echo_ack_num: -1,
-                                ..Default::default()
-                            }]);
-                            transport.set_pending(host);
-                        }
-                    }
-                    if !sent_banner {
+            if let Ok((n, addr)) = sock.recv_from(&mut buf) {
+                client_addr = Some(addr);
+                if let Some(diff) = transport.recv(&buf[..n]) {
+                    if !diff.is_empty() {
                         let host = HostInstruction::encode_message(&[HostInstruction {
-                            hoststring: b"\x1b[H\x1b[2J$ ".to_vec(),
+                            hoststring: format!("\x1b[H\x1b[2J$ echo {marker}\r\n{marker}\r\n$ ")
+                                .into_bytes(),
                             echo_ack_num: -1,
                             ..Default::default()
                         }]);
                         transport.set_pending(host);
-                        sent_banner = true;
                     }
                 }
-                Err(_) => {}
+                if !sent_banner {
+                    let host = HostInstruction::encode_message(&[HostInstruction {
+                        hoststring: b"\x1b[H\x1b[2J$ ".to_vec(),
+                        echo_ack_num: -1,
+                        ..Default::default()
+                    }]);
+                    transport.set_pending(host);
+                    sent_banner = true;
+                }
             }
             if let Some(addr) = client_addr {
                 for dg in transport.tick() {

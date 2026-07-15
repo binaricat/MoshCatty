@@ -784,8 +784,8 @@ impl Framebuffer {
                 }
             }
             if let Some(last) = last_non_space {
-                for x in 0..=last {
-                    if !visible[x] {
+                for (x, is_visible) in visible.iter().enumerate().take(last + 1) {
+                    if !is_visible {
                         continue;
                     }
                     let c = self.cell_at(x, y).expect("framebuffer bounds");
@@ -849,8 +849,8 @@ impl Framebuffer {
                 continue;
             };
             let visible = visible_cell_starts(self, y);
-            for x in first..=last {
-                if !visible[x] {
+            for (x, is_visible) in visible.iter().enumerate().take(last + 1).skip(first) {
+                if !is_visible {
                     continue;
                 }
                 let c = self.cell_at(x, y).expect("framebuffer bounds");

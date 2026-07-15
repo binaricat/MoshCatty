@@ -134,21 +134,17 @@ impl Assembler {
             self.total_num = Some(idx + 1);
         }
 
-        let Some(total) = self.total_num else {
-            return None;
-        };
+        let total = self.total_num?;
         if self.fragments.len() < total {
             return None;
         }
-        for i in 0..total {
-            if self.fragments[i].is_none() {
-                return None;
-            }
+        for fragment in self.fragments.iter().take(total) {
+            fragment.as_ref()?;
         }
 
         let mut msg = Vec::new();
-        for i in 0..total {
-            msg.extend_from_slice(self.fragments[i].as_ref().unwrap());
+        for fragment in self.fragments.iter().take(total) {
+            msg.extend_from_slice(fragment.as_ref().expect("fragments checked above"));
         }
         self.fragments.clear();
         self.total_num = None;

@@ -29,7 +29,7 @@ pub mod prediction;
 pub mod terminal;
 pub mod transport;
 
-pub use client::Client;
+pub use client::{Client, ConnectionStatus};
 pub use crypto::Ocb;
 pub use error::{Error, Result};
 pub use framebuffer::Framebuffer;

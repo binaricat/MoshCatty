@@ -46,7 +46,11 @@ const SEEN_SEQ_CAP: usize = 512;
 /// Maximum number of complete remote states retained while the peer keeps
 /// referencing an old base. Once full, reject newer branches until the peer's
 /// throwaway watermark makes room; never ACK a state whose base was discarded.
-pub(crate) const RECEIVED_STATE_CAP: usize = 256;
+/// Stock starts receiver quenching after roughly 1024 retained branches. Keep
+/// the same useful window; TerminalView's separate 128 MiB budget remains the
+/// hard memory-safety backstop for unusually large screens.
+pub(crate) const RECEIVED_STATE_CAP: usize = 1024;
+const RECEIVER_QUENCH_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReceivedStateDiff {
@@ -102,6 +106,7 @@ pub struct Transport {
 
     last_send: Instant,
     last_recv: Instant,
+    last_remote_state: Instant,
     received_authenticated: bool,
     last_roundtrip_success: Instant,
     /// Last remote timestamp usable for echo; None until a timely sample.
@@ -119,6 +124,7 @@ pub struct Transport {
     shutdown_started: Option<Instant>,
     shutdown_tries: u8,
     counterparty_shutdown_ack_sent: bool,
+    receiver_quench_until: Option<Instant>,
 }
 
 impl Transport {
@@ -165,6 +171,7 @@ impl Transport {
             seen_seq_order: Vec::new(),
             last_send: Instant::now(),
             last_recv: Instant::now(),
+            last_remote_state: Instant::now(),
             received_authenticated: false,
             last_roundtrip_success: Instant::now(),
             last_ts: None,
@@ -179,6 +186,7 @@ impl Transport {
             shutdown_started: None,
             shutdown_tries: 0,
             counterparty_shutdown_ack_sent: false,
+            receiver_quench_until: None,
         }
     }
 
@@ -241,6 +249,11 @@ impl Transport {
     /// Time of last successfully authenticated inbound datagram.
     pub fn last_recv(&self) -> Instant {
         self.last_recv
+    }
+
+    /// Time of the last complete, version-correct remote SSP state.
+    pub fn last_remote_state(&self) -> Instant {
+        self.last_remote_state
     }
 
     pub fn has_received_authenticated(&self) -> bool {
@@ -556,12 +569,18 @@ impl Transport {
             self.received_nums.retain(|&n| n >= self.throwaway_num);
         }
 
-        // Match stock mosh's safety rule: do not drop an already accepted
-        // middle state merely to make space. Reject the new state until the
-        // sender advances throwaway_num, so transport and terminal snapshots
-        // always retain the same bases.
-        if self.received_nums.len() >= RECEIVED_STATE_CAP {
-            return None;
+        // Match stock's receiver quench: once the useful 1024-state window is
+        // exceeded, admit at most one additional branch every 15 seconds.
+        // Never discard a middle state that may still be referenced.
+        if self.received_nums.len() > RECEIVED_STATE_CAP {
+            let now = Instant::now();
+            if self
+                .receiver_quench_until
+                .is_some_and(|deadline| now < deadline)
+            {
+                return None;
+            }
+            self.receiver_quench_until = Some(now + RECEIVER_QUENCH_INTERVAL);
         }
 
         self.received_nums.push(ti.new_num);
@@ -569,6 +588,7 @@ impl Transport {
         // SSP state has been accepted. One authenticated fragment must not
         // disable the client's 15-second connection timeout forever.
         self.received_authenticated = true;
+        self.last_remote_state = Instant::now();
 
         // Only advance ack_num forward (upstream tracks sorted list + back).
         if ti.new_num > self.ack_num {
@@ -789,6 +809,29 @@ mod tests {
 
         assert!(client.recv(&datagrams[0]).is_none());
         assert!(!client.has_received_authenticated());
+    }
+
+    #[test]
+    fn authenticated_partial_fragments_do_not_refresh_complete_state_contact() {
+        let (mut server, mut client) = pair();
+        let mut seed = 0x9e37_79b9_u32;
+        let payload: Vec<u8> = (0..MAX_FRAGMENT_PAYLOAD * 3)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            })
+            .collect();
+        server.set_pending(payload);
+        let datagrams = server.tick();
+        assert!(datagrams.len() >= 2, "test payload must fragment");
+
+        client.last_remote_state = Instant::now() - Duration::from_secs(7);
+        let complete_contact = client.last_remote_state();
+        assert!(client.recv_state(&datagrams[0]).is_none());
+        assert_eq!(client.last_remote_state(), complete_contact);
+        assert!(client.last_recv().elapsed() < Duration::from_secs(1));
     }
 
     #[test]
@@ -1194,7 +1237,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_state_queue_rejects_new_branches_until_throwaway_frees_space() {
+    fn remote_state_queue_matches_stock_periodic_receiver_quench() {
         let (mut server, mut client) = pair();
         let mut accepted = 0usize;
         for state in 1..=(RECEIVED_STATE_CAP + 4) {
@@ -1205,10 +1248,19 @@ mod tests {
                 }
             }
         }
-        assert_eq!(accepted, RECEIVED_STATE_CAP - 1);
-        assert_eq!(client.received_nums.len(), RECEIVED_STATE_CAP);
+        assert_eq!(accepted, RECEIVED_STATE_CAP + 1);
+        assert_eq!(client.received_nums.len(), RECEIVED_STATE_CAP + 2);
         assert!(client.received_nums.contains(&0));
-        assert_eq!(client.ack_num(), (RECEIVED_STATE_CAP - 1) as u64);
+        assert_eq!(client.ack_num(), (RECEIVED_STATE_CAP + 1) as u64);
+
+        // Stock lets one more state through after each 15-second quench.
+        client.receiver_quench_until = Some(Instant::now() - Duration::from_millis(1));
+        server.set_pending(b"periodic-quench-release".to_vec());
+        let periodically_released = server
+            .tick()
+            .into_iter()
+            .find_map(|datagram| client.recv_state(&datagram));
+        assert!(periodically_released.is_some());
 
         // Let the sender learn the highest accepted state. Its next branch may
         // still reference state 0 in this packet, so the receiver must clone
@@ -1224,8 +1276,24 @@ mod tests {
             .find_map(|datagram| client.recv_state(&datagram));
         let recovered = recovered.expect("throwaway should make queue space");
         assert!(recovered.throwaway_num > 0);
-        assert!(client.received_nums.len() < RECEIVED_STATE_CAP);
+        assert!(client.received_nums.len() < RECEIVED_STATE_CAP + 2);
         assert!(!client.received_nums.contains(&0));
+    }
+
+    #[test]
+    fn receiver_keeps_at_least_three_hundred_parallel_states_like_stock_mosh() {
+        let (mut server, mut client) = pair();
+        let mut accepted = 0;
+        for state in 1..=300 {
+            server.set_pending(vec![(state & 0xff) as u8]);
+            for datagram in server.tick() {
+                if client.recv_state(&datagram).is_some() {
+                    accepted += 1;
+                }
+            }
+        }
+        assert_eq!(accepted, 300);
+        assert_eq!(client.ack_num(), 300);
     }
 
     #[test]

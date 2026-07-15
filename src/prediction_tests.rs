@@ -430,7 +430,7 @@ fn cr_advances_row_when_not_bottom() {
 }
 
 #[test]
-fn original_ch_no_credit_for_noop() {
+fn original_contents_no_credit_for_noop() {
     let mut p = always();
     let mut host = blank_fb();
     host.put_rune(0, 0, 'a', Attr::default());
@@ -904,6 +904,82 @@ fn never_mode_passthrough_host_bytes() {
     assert_eq!(out, b"\x1b[Hhello");
     assert!(pipe.on_keystroke(b"x").is_empty());
     assert!(!pipe.using_overlay_path());
+}
+
+#[test]
+fn notification_uses_the_single_framebuffer_paint_path_and_restores_host_row() {
+    let mut pipe = DisplayPipeline::new(40, 10, DisplayPreference::Never);
+    assert_eq!(
+        pipe.on_host_bytes(b"\x1b[Horiginal prompt"),
+        b"\x1b[Horiginal prompt"
+    );
+
+    let paint = pipe.set_notification(Some("mosh: Last contact 7 seconds ago.".to_string()));
+    assert!(!paint.is_empty());
+    assert!(pipe.using_overlay_path());
+    let shown = pipe.last_shown().expect("notification frame");
+    let message = "mosh: Last contact 7 seconds ago.";
+    for (x, expected) in message.chars().enumerate() {
+        let cell = shown.cell_at(x, 0).unwrap();
+        assert_eq!(cell.ch, expected);
+        assert!(cell.attr.bold);
+        assert_eq!(cell.attr.fg, crate::framebuffer::Color::index(7));
+        assert_eq!(cell.attr.bg, crate::framebuffer::Color::index(4));
+    }
+    assert!(
+        !shown.cursor_visible,
+        "top-row notification hides its cursor"
+    );
+
+    let _ = pipe.on_host_bytes(b"\x1b[Hchanged behind bar");
+    let shown = pipe.last_shown().unwrap();
+    assert_eq!(shown.cell_at(0, 0).unwrap().ch, 'm');
+
+    let clear = pipe.set_notification(None);
+    assert!(!clear.is_empty());
+    assert!(!pipe.using_overlay_path());
+    let shown = pipe.last_shown().unwrap();
+    let restored = (0..18)
+        .map(|x| shown.cell_at(x, 0).unwrap().ch)
+        .collect::<String>();
+    assert_eq!(restored, "changed behind bar");
+    assert!(shown.cursor_visible);
+}
+
+#[test]
+fn unchanged_notification_does_not_repaint() {
+    let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Adaptive);
+    let message = Some("mosh: Last reply 12 seconds ago.".to_string());
+    assert!(!pipe.set_notification(message.clone()).is_empty());
+    assert!(pipe.set_notification(message).is_empty());
+}
+
+#[test]
+fn adaptive_demote_clears_predictions_while_notification_stays_visible() {
+    let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Adaptive);
+    let _ = pipe.set_srtt(Some(Duration::from_millis(100)));
+    let _ = pipe.on_host_bytes(b"\x1b[2;1H$ ");
+    pipe.prove_band_for_test();
+    let _ = pipe.on_keystroke(b"x");
+    assert_eq!(pipe.last_shown().unwrap().cell_at(2, 1).unwrap().ch, 'x');
+    let _ = pipe.set_notification(Some("mosh: Last contact 7 seconds ago.".to_string()));
+
+    pipe.predictor_mut_for_test().reset();
+    let paint = pipe.set_srtt(Some(Duration::from_millis(5)));
+    assert!(!paint.is_empty());
+    assert_eq!(pipe.last_shown().unwrap().cell_at(2, 1).unwrap().ch, ' ');
+    assert_eq!(pipe.last_shown().unwrap().cell_at(0, 0).unwrap().ch, 'm');
+    assert!(pipe.using_overlay_path());
+}
+
+#[test]
+fn bulk_paste_does_not_clear_an_active_network_notification() {
+    let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Always);
+    let _ = pipe.set_notification(Some("mosh: Last contact 8 seconds ago.".to_string()));
+    let _ = pipe.on_keystroke(&vec![b'x'; 101]);
+    let shown = pipe.last_shown().unwrap();
+    assert_eq!(shown.cell_at(0, 0).unwrap().ch, 'm');
+    assert_eq!(shown.cell_at(1, 0).unwrap().ch, 'o');
 }
 
 #[test]
@@ -2045,7 +2121,7 @@ fn pipeline_late_ack_without_host_bytes_drains_pending() {
 }
 
 #[test]
-fn kill_epoch_does_not_stick_synthetic_cursor_pending() {
+fn kill_epoch_anchors_host_cursor_until_normal_confirmation() {
     let mut p = always();
     p.set_overwrite_for_test(true);
     p.set_cursor(0, 0);
@@ -2054,7 +2130,12 @@ fn kill_epoch_does_not_stick_synthetic_cursor_pending() {
     fb.put_rune(0, 0, 'x', Attr::default());
     fb.cur_x = 5;
     p.confirm(&fb); // tentative diverge → kill_epoch
-    assert!(!p.active(), "no sticky active after empty kill");
+    assert!(p.active(), "stock keeps the host cursor conditional");
+    let mut painted = fb.clone();
+    p.overlay(&mut painted);
+    assert_eq!((painted.cur_x, painted.cur_y), (5, fb.cur_y));
+    p.confirm(&fb);
+    assert!(!p.active(), "matching host cursor drains normally");
     // set_cursor must work again
     p.set_cursor(2, 3);
     assert_eq!(p.cur_x(), 2);
@@ -2078,6 +2159,26 @@ fn overwrite_retype_same_cell_replaces_not_stacks() {
         }
     }
     assert_eq!(count, 1, "must not stack overwrite preds at same cell");
+}
+
+#[test]
+fn repeated_overwrite_value_does_not_falsely_confirm_a_tentative_epoch() {
+    let mut p = always();
+    p.set_overwrite_for_test(true);
+    let mut host = blank_fb();
+    p.set_cursor(0, 0);
+    p.keystroke(b"b", &host);
+    p.keystroke(b"\x1b[D", &host);
+    p.keystroke(b"b", &host);
+
+    host.put_rune(0, 0, 'b', Attr::default());
+    p.confirm(&host);
+
+    assert_eq!(
+        p.confirmed_epoch_for_test(),
+        0,
+        "a value already predicted at this cell is CorrectNoCredit in stock mosh"
+    );
 }
 
 #[test]
@@ -2128,6 +2229,24 @@ fn overlay_does_not_move_cursor_for_tentative_cr() {
     p.overlay(&mut view2);
     // Cursor must stay at host (row 0), not jump to row 1 (tentative CR)
     assert_eq!(view2.cur_y, 0, "tentative CR must not move glass cursor");
+}
+
+#[test]
+fn tentative_new_cursor_keeps_the_last_confirmed_cursor_visible() {
+    let mut p = always_proven();
+    p.set_overwrite_for_test(true);
+    let host = blank_fb();
+    p.set_cursor(0, 0);
+    p.keystroke(b"ab", &host);
+    p.keystroke(b"\r", &host);
+
+    let mut view = blank_fb();
+    p.overlay(&mut view);
+    assert_eq!(
+        (view.cur_x, view.cur_y),
+        (2, 0),
+        "stock applies the older confirmed cursor and hides the newer tentative CR"
+    );
 }
 
 #[test]

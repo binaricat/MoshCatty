@@ -101,10 +101,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // predicted glyphs beside HostBytes (Netcatty #2121).
     let mut display =
         DisplayPipeline::new(cols as usize, rows as usize, DisplayPreference::from_env());
+    let mut local_escape = LocalEscape::from_env();
     let mut last_resize_check = Instant::now();
     let mut cur_cols = cols;
     let mut cur_rows = rows;
     let mut last_remote_state_num = 0;
+    let mut last_notification = None;
 
     while running.load(Ordering::SeqCst) {
         if client.is_dead() {
@@ -143,6 +145,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             stdout.write_all(&ack_paint)?;
             stdout.flush()?;
         }
+
+        let notification = local_escape.help_message().map(str::to_owned).or_else(|| {
+            client.connection_status().message(port).map(|mut message| {
+                if let Some(hint) = local_escape.quit_hint() {
+                    message.push_str(hint);
+                }
+                message
+            })
+        });
+        if notification != last_notification {
+            let notification_paint = display.set_notification(notification.clone());
+            if !notification_paint.is_empty() {
+                stdout.write_all(&notification_paint)?;
+                stdout.flush()?;
+            }
+            last_notification = notification;
+        }
         // A shutdown state may carry the peer's final frame. Paint and confirm
         // it before leaving the display loop.
         if remote_shutdown {
@@ -158,12 +177,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         match stdin_rx.try_recv() {
             Ok(Some(buf)) if !buf.is_empty() => {
-                let local = display.on_keystroke(&buf);
+                let input = local_escape.process(&buf);
+                let local = display.on_keystroke(&input.forward);
                 if !local.is_empty() {
                     stdout.write_all(&local)?;
                     stdout.flush()?;
                 }
-                client.send_keys(&buf);
+                client.send_keys(&input.forward);
+                if input.quit {
+                    let exiting = Some("mosh: Exiting on user request...".to_string());
+                    let paint = display.set_notification(exiting);
+                    if !paint.is_empty() {
+                        stdout.write_all(&paint)?;
+                        stdout.flush()?;
+                    }
+                    break;
+                }
             }
             Ok(None) => {
                 // EOF: drain remaining paint briefly then exit (PTY closed).
@@ -314,6 +343,148 @@ fn spawn_stdin_reader() -> Receiver<Option<Vec<u8>>> {
 fn print_usage() {
     eprintln!("Usage: MOSH_KEY=<key> mosh-client <host> <port>");
     eprintln!("Pure Rust Mosh client (Netcatty). No Cygwin / terminfo required.");
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LocalInput {
+    forward: Vec<u8>,
+    quit: bool,
+}
+
+/// Stock mosh's local escape command, adapted for a cross-platform child PTY.
+/// Quit and literal-escape are supported everywhere. Process suspension is
+/// intentionally omitted because stopping a ConPTY child can freeze its host.
+struct LocalEscape {
+    escape_key: Option<u8>,
+    pass_key: u8,
+    pass_key2: u8,
+    requires_line_start: bool,
+    line_start: bool,
+    pending: bool,
+    help: Option<String>,
+    quit_hint: Option<String>,
+}
+
+impl LocalEscape {
+    fn from_env() -> Self {
+        let value = env::var("MOSH_ESCAPE_KEY").ok();
+        Self::from_value(value.as_deref())
+    }
+
+    fn from_value(value: Option<&str>) -> Self {
+        let configured = match value {
+            Some("") => None,
+            Some(value) if value.len() == 1 && value.as_bytes()[0] < 128 => {
+                Some(value.as_bytes()[0])
+            }
+            Some(_) | None => Some(0x1e),
+        };
+        let escape_key = match configured {
+            Some(0x03 | 0x04 | 0x0a | 0x0c | 0x0d | 0x00) => Some(0x1e),
+            other => other,
+        };
+
+        let (pass_key, pass_key2, requires_line_start, help, quit_hint) =
+            if let Some(key) = escape_key {
+                let pass = if key < 32 { key + b'@' } else { key };
+                let pass2 = if pass.is_ascii_uppercase() {
+                    pass.to_ascii_lowercase()
+                } else {
+                    pass
+                };
+                let key_name = if key < 32 {
+                    format!("Ctrl-{}", pass as char)
+                } else {
+                    format!("\"{}\"", key as char)
+                };
+                (
+                    pass,
+                    pass2,
+                    key >= 32,
+                    Some(format!(
+                        "mosh: Commands: \".\" quits, \"{}\" gives literal {}",
+                        pass as char, key_name
+                    )),
+                    Some(format!(" [To quit: {key_name} .]")),
+                )
+            } else {
+                (0, 0, false, None, None)
+            };
+
+        Self {
+            escape_key,
+            pass_key,
+            pass_key2,
+            requires_line_start,
+            // Stock starts with lf_entered=false. Printable escape keys only
+            // become commands after the user actually enters a newline.
+            line_start: false,
+            pending: false,
+            help,
+            quit_hint,
+        }
+    }
+
+    fn process(&mut self, input: &[u8]) -> LocalInput {
+        let mut forward = Vec::with_capacity(input.len());
+        for &byte in input {
+            if self.pending {
+                self.pending = false;
+                if byte == b'.' {
+                    return LocalInput {
+                        forward,
+                        quit: true,
+                    };
+                }
+                // Stock suspends the local Unix process here. MoshCatty runs
+                // as a managed PTY child on every platform, so consume the
+                // command without forwarding Ctrl-Z to the remote shell.
+                if byte == 0x1a {
+                    self.line_start = false;
+                    continue;
+                }
+                if byte == self.pass_key || byte == self.pass_key2 {
+                    if let Some(key) = self.escape_key {
+                        forward.push(key);
+                    }
+                } else {
+                    if let Some(key) = self.escape_key {
+                        forward.push(key);
+                    }
+                    forward.push(byte);
+                }
+                // Starting an escape command clears stock's `lf_entered`.
+                // Its second byte never re-arms line-start detection, even
+                // when that byte itself is CR/LF.
+                continue;
+            }
+
+            if self.escape_key == Some(byte) && (!self.requires_line_start || self.line_start) {
+                self.pending = true;
+                self.line_start = false;
+                continue;
+            }
+
+            forward.push(byte);
+            self.line_start = byte == b'\n' || byte == b'\r';
+        }
+        LocalInput {
+            forward,
+            quit: false,
+        }
+    }
+
+    fn help_message(&self) -> Option<&str> {
+        if self.pending {
+            self.help.as_deref()
+        } else {
+            None
+        }
+    }
+
+    fn quit_hint(&self) -> Option<&str> {
+        self.quit_hint.as_deref()
+    }
 }
 
 #[cfg(unix)]
@@ -635,6 +806,76 @@ fn install_signal_flag(running: Arc<AtomicBool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_local_escape_quits_without_forwarding_control_bytes() {
+        let mut escape = LocalEscape::from_value(None);
+        let first = escape.process(b"ab\x1e");
+        assert_eq!(first.forward, b"ab");
+        assert!(!first.quit);
+        assert!(escape.help_message().is_some());
+
+        let second = escape.process(b".discarded");
+        assert!(second.quit);
+        assert!(second.forward.is_empty());
+        assert!(escape.help_message().is_none());
+    }
+
+    #[test]
+    fn local_escape_preserves_ordinary_bytes_before_quit_in_the_same_read() {
+        let mut escape = LocalEscape::from_value(None);
+        let result = escape.process(b"echo ready\x1e.");
+        assert!(result.quit);
+        assert_eq!(result.forward, b"echo ready");
+    }
+
+    #[test]
+    fn default_local_escape_can_send_a_literal_escape_or_unknown_sequence() {
+        let mut escape = LocalEscape::from_value(None);
+        assert_eq!(escape.process(b"\x1e^").forward, b"\x1e");
+        assert_eq!(escape.process(b"\x1ex").forward, b"\x1ex");
+    }
+
+    #[test]
+    fn local_suspend_command_is_not_forwarded_to_the_remote_shell() {
+        let mut escape = LocalEscape::from_value(None);
+        let result = escape.process(b"\x1e\x1a");
+        assert!(!result.quit);
+        assert!(result.forward.is_empty());
+    }
+
+    #[test]
+    fn empty_escape_setting_disables_local_commands() {
+        let mut escape = LocalEscape::from_value(Some(""));
+        let result = escape.process(b"\x1e.");
+        assert_eq!(result.forward, b"\x1e.");
+        assert!(!result.quit);
+        assert!(escape.quit_hint().is_none());
+    }
+
+    #[test]
+    fn printable_custom_escape_only_starts_after_a_newline() {
+        let mut escape = LocalEscape::from_value(Some("~"));
+        assert_eq!(escape.process(b"~.").forward, b"~.");
+        assert_eq!(escape.process(b"x~.").forward, b"x~.");
+        assert!(!escape.process(b"\n~").quit);
+        assert!(escape.help_message().is_some());
+        assert!(escape.process(b".").quit);
+    }
+
+    #[test]
+    fn newline_as_escape_command_payload_does_not_rearm_printable_escape() {
+        let mut escape = LocalEscape::from_value(Some("~"));
+        let result = escape.process(b"\n~\n~.");
+        assert!(!result.quit);
+        assert_eq!(result.forward, b"\n~\n~.");
+    }
+
+    #[test]
+    fn unsafe_custom_control_escape_falls_back_to_ctrl_caret() {
+        let escape = LocalEscape::from_value(Some("\x03"));
+        assert_eq!(escape.quit_hint(), Some(" [To quit: Ctrl-^ .]"));
+    }
 
     #[test]
     fn windows_vt_raw_mode_preserves_shortcut_escape_sequences() {

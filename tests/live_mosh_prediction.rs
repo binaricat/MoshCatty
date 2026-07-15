@@ -14,7 +14,7 @@
 //! over UDP.
 
 use moshcatty::terminal::strip_ansi;
-use moshcatty::{Client, DisplayPipeline, DisplayPreference, Ocb};
+use moshcatty::{Client, ConnectionStatus, DisplayPipeline, DisplayPreference, Ocb};
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::process::Command;
@@ -598,8 +598,12 @@ fn live_session_recovers_after_silent_udp_blackhole() {
 
     proxy.set_blackholed(true);
     let outage_deadline = Instant::now() + Duration::from_secs(12);
+    let mut saw_outage_notification = false;
     while Instant::now() < outage_deadline {
         client.poll().expect("poll during blackhole");
+        if matches!(client.connection_status(), ConnectionStatus::LastContact(_)) {
+            saw_outage_notification = true;
+        }
         assert!(
             !client.is_dead(),
             "client died during a recoverable outage: {:?}",
@@ -607,6 +611,10 @@ fn live_session_recovers_after_silent_udp_blackhole() {
         );
         thread::sleep(Duration::from_millis(15));
     }
+    assert!(
+        saw_outage_notification,
+        "stock-compatible last-contact notification never appeared"
+    );
     proxy.set_blackholed(false);
 
     client.send_keys(b"echo AFTER_BLACKHOLE_OK\n");
@@ -627,6 +635,11 @@ fn live_session_recovers_after_silent_udp_blackhole() {
             .lines()
             .any(|line| line == "AFTER_BLACKHOLE_OK"),
         "same session did not recover after blackhole; screen={recovered_screen:?}"
+    );
+    assert_eq!(
+        client.connection_status(),
+        ConnectionStatus::Online,
+        "network notification did not clear after recovery"
     );
     assert!(
         client

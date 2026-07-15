@@ -27,6 +27,78 @@ const MAX_OLD_SOCKET_AGE: Duration = Duration::from_secs(60);
 const MAX_PORTS_OPEN: usize = 10;
 const IPV6_FRAGMENT_PAYLOAD: usize = 1178;
 const FALLBACK_FRAGMENT_PAYLOAD: usize = 462;
+const CONNECTING_NOTICE_AFTER: Duration = Duration::from_millis(250);
+const SERVER_LATE_AFTER: Duration = Duration::from_millis(6_500);
+const REPLY_LATE_AFTER: Duration = Duration::from_secs(10);
+
+/// Stock-mosh-compatible connection state used by the terminal notification
+/// overlay. `Online` means no notification is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionStatus {
+    Online,
+    Connecting(Duration),
+    LastContact(Duration),
+    LastReply(Duration),
+}
+
+impl ConnectionStatus {
+    /// Text drawn by stock mosh's blue notification bar.
+    pub fn message(self, remote_port: u16) -> Option<String> {
+        match self {
+            Self::Online => None,
+            Self::Connecting(_) => Some(format!(
+                "mosh: Nothing received from server on UDP port {remote_port}."
+            )),
+            Self::LastContact(elapsed) => Some(format!(
+                "mosh: Last contact {} ago.",
+                human_readable_duration(elapsed)
+            )),
+            Self::LastReply(elapsed) => Some(format!(
+                "mosh: Last reply {} ago.",
+                human_readable_duration(elapsed)
+            )),
+        }
+    }
+}
+
+fn classify_connection_status(
+    attached: bool,
+    since_contact: Duration,
+    since_reply: Duration,
+) -> ConnectionStatus {
+    if !attached {
+        return if since_contact > CONNECTING_NOTICE_AFTER {
+            ConnectionStatus::Connecting(since_contact)
+        } else {
+            ConnectionStatus::Online
+        };
+    }
+
+    // Upstream prefers the downlink failure whenever both directions are late.
+    if since_contact > SERVER_LATE_AFTER {
+        ConnectionStatus::LastContact(since_contact)
+    } else if since_reply > REPLY_LATE_AFTER {
+        ConnectionStatus::LastReply(since_reply)
+    } else {
+        ConnectionStatus::Online
+    }
+}
+
+fn human_readable_duration(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds < 60 {
+        format!("{seconds} seconds")
+    } else if seconds < 3_600 {
+        format!("{}:{:02}", seconds / 60, seconds % 60)
+    } else {
+        format!(
+            "{}:{:02}:{:02}",
+            seconds / 3_600,
+            (seconds / 60) % 60,
+            seconds % 60
+        )
+    }
+}
 
 fn is_message_too_long(error: &std::io::Error) -> bool {
     #[cfg(unix)]
@@ -134,6 +206,16 @@ impl Client {
         self.dead_reason.as_deref()
     }
 
+    /// Current reachability state using the same timers and precedence as
+    /// stock mosh's NotificationEngine.
+    pub fn connection_status(&self) -> ConnectionStatus {
+        classify_connection_status(
+            self.transport.has_received_authenticated(),
+            self.transport.last_remote_state().elapsed(),
+            self.transport.last_roundtrip_success().elapsed(),
+        )
+    }
+
     pub fn remote_shutdown_ack_sent(&self) -> bool {
         self.transport.counterparty_shutdown_ack_sent()
     }
@@ -147,6 +229,10 @@ impl Client {
         if self.remote_shutdown_ack_sent() {
             return Ok(true);
         }
+        // Stock shutdown carries the current user state. Flush input queued in
+        // the same stdin read as EOF / the local quit command before changing
+        // the transport into its no-more-writes shutdown mode.
+        self.flush_ticks()?;
         self.transport.start_shutdown();
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -243,7 +329,7 @@ impl Client {
         }
 
         if !self.transport.has_received_authenticated()
-            && self.transport.last_recv().elapsed() > INITIAL_CONNECT_TIMEOUT
+            && self.transport.last_remote_state().elapsed() > INITIAL_CONNECT_TIMEOUT
         {
             self.mark_dead("mosh did not hear from the server (initial connection timeout)");
             return Ok(paint);
@@ -405,6 +491,59 @@ mod tests {
     use std::net::UdpSocket;
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    #[test]
+    fn connection_status_matches_stock_mosh_thresholds() {
+        assert_eq!(
+            classify_connection_status(
+                false,
+                Duration::from_millis(250),
+                Duration::from_millis(250)
+            ),
+            ConnectionStatus::Online
+        );
+        assert_eq!(
+            classify_connection_status(
+                false,
+                Duration::from_millis(251),
+                Duration::from_millis(251)
+            ),
+            ConnectionStatus::Connecting(Duration::from_millis(251))
+        );
+        assert_eq!(
+            classify_connection_status(true, Duration::from_millis(6_500), Duration::from_secs(11)),
+            ConnectionStatus::LastReply(Duration::from_secs(11))
+        );
+        assert_eq!(
+            classify_connection_status(true, Duration::from_millis(6_501), Duration::from_secs(11)),
+            ConnectionStatus::LastContact(Duration::from_millis(6_501))
+        );
+        assert_eq!(
+            classify_connection_status(true, Duration::from_secs(2), Duration::from_millis(10_001)),
+            ConnectionStatus::LastReply(Duration::from_millis(10_001))
+        );
+        assert_eq!(
+            classify_connection_status(true, Duration::from_secs(2), Duration::from_secs(3)),
+            ConnectionStatus::Online
+        );
+    }
+
+    #[test]
+    fn connection_status_uses_stock_human_readable_duration() {
+        assert_eq!(
+            ConnectionStatus::LastContact(Duration::from_secs(9)).message(60001),
+            Some("mosh: Last contact 9 seconds ago.".to_string())
+        );
+        assert_eq!(
+            ConnectionStatus::LastReply(Duration::from_secs(65)).message(60001),
+            Some("mosh: Last reply 1:05 ago.".to_string())
+        );
+        assert_eq!(
+            ConnectionStatus::Connecting(Duration::from_secs(1)).message(60001),
+            Some("mosh: Nothing received from server on UDP port 60001.".to_string())
+        );
+        assert_eq!(ConnectionStatus::Online.message(60001), None);
+    }
 
     fn spawn_echo_server(marker: &'static str) -> (u16, String, thread::JoinHandle<()>) {
         let mut key = [0u8; 16];
@@ -606,6 +745,61 @@ mod tests {
         assert!(client
             .graceful_shutdown(Duration::from_secs(1))
             .expect("shutdown"));
+    }
+
+    #[test]
+    fn graceful_shutdown_includes_keys_queued_immediately_before_exit() {
+        let key = [41u8; 16];
+        let key_b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .encode(key)
+                .trim_end_matches('=')
+                .to_string()
+        };
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let server_received = received.clone();
+        let server = thread::spawn(move || {
+            let mut transport = Transport::new_server(Ocb::new(&key).unwrap());
+            let mut wire = [0u8; 4096];
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut client_addr = None;
+            while Instant::now() < deadline {
+                if let Ok((n, addr)) = socket.recv_from(&mut wire) {
+                    client_addr = Some(addr);
+                    if let Some(diff) = transport.recv(&wire[..n]) {
+                        for instruction in
+                            UserInstruction::decode_message(&diff).unwrap_or_default()
+                        {
+                            if !instruction.keys.is_empty() {
+                                *server_received.lock().unwrap() = instruction.keys;
+                            }
+                        }
+                    }
+                }
+                if let Some(addr) = client_addr {
+                    for datagram in transport.tick() {
+                        socket.send_to(&datagram, addr).unwrap();
+                    }
+                }
+                if transport.ack_num() == u64::MAX {
+                    break;
+                }
+            }
+        });
+
+        let mut client = Client::dial("127.0.0.1", port, &key_b64).unwrap();
+        client.send_keys(b"FINAL_BEFORE_EXIT");
+        assert!(client
+            .graceful_shutdown(Duration::from_secs(2))
+            .expect("shutdown"));
+        server.join().unwrap();
+        assert_eq!(&*received.lock().unwrap(), b"FINAL_BEFORE_EXIT");
     }
 
     #[test]

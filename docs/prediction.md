@@ -9,6 +9,7 @@ Related: [Netcatty #2121](https://github.com/binaricat/Netcatty/issues/2121)
 HostBytes → apply_ansi (sticky carry) → host_fb → Confirm → Overlay → Diff(last_shown) → PTY
 Keystroke → Predictor → same Diff path (paint only when show)
 Frame watermarks → set_frames → Confirm (ack-only packets too)
+Network timers → Notification → same Diff path (top row, restored on recovery)
 ```
 
 **Loop order (live client):** `poll` → `on_host_bytes` (if paint) → `set_frames` (late_ack Confirm).  
@@ -34,6 +35,7 @@ Never require terminfo / Cygwin / system mosh. Pure Rust standalone binary only.
 | Always | forces show, not flagging |
 | Adaptive | hold show while pending or cursor Pending |
 | Experimental | show immediately; discard only a failed cell instead of its prediction band |
+| Network status | stock 250ms / 6.5s / 10s thresholds; notification shares the single Diff path |
 
 ## Env
 
@@ -49,15 +51,13 @@ Never require terminfo / Cygwin / system mosh. Pure Rust standalone binary only.
 | System / Cygwin mosh-client / terminfo | Pure single-binary is the product |
 | Full VTE emulator | HostBytes+Diff under node-pty is the fit |
 | Bit-identical Diff vs stock `new_frame` | Different encoder; cell semantics matter |
-| Notification / title chrome overlays | Netcatty owns chrome |
+| Title prefix chrome | Netcatty owns the session title |
 | Scroll-history / up-down arrow prediction | Stock also defers / absent |
-| `original_contents` multi-history vector | Single `original_ch` approximation |
-| Multi-cursor tentative list | Single `(cur_x,cur_y)` + `cursor_exp_sent` |
 | Wall-clock 15s expire | Product safety; Pending still held by late_ack |
 
 ## Modules
 
 - `framebuffer.rs` — cells + Diff + `scroll_generation`
 - `ansi_apply.rs` — HostBytes → host_fb (+ scroll bumps generation)
-- `prediction.rs` + `prediction_tests.rs` — Predictor + DisplayPipeline + regression gates
+- `prediction.rs` + `prediction_tests.rs` — Predictor + DisplayPipeline + prediction/network overlays + regression gates
 - `mosh_client.rs` — host-before-ack loop wiring

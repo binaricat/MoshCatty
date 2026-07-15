@@ -15,6 +15,7 @@ use crate::ansi_apply::{apply_ansi_with_pen, AnsiPen};
 use crate::error::{Error, Result};
 use crate::framebuffer::Framebuffer;
 use crate::pb::HostInstruction;
+#[cfg(test)]
 use crate::transport::RECEIVED_STATE_CAP;
 
 const MAX_TERMINAL_COLS: usize = 1000;
@@ -209,11 +210,9 @@ impl TerminalView {
         if throwaway_num > 0 {
             self.remote_states.retain(|&num, _| num >= throwaway_num);
         }
-        if self.remote_states.len() >= RECEIVED_STATE_CAP {
-            return Err(Error::Protocol(
-                "remote state queue is full before terminal insertion".to_string(),
-            ));
-        }
+        // Transport applies stock's 1024-state receiver quench. Keep every
+        // state it accepts so future branches never reference a missing base;
+        // the byte budget above remains the hard memory-safety boundary.
         self.remote_states.insert(new_num, next.clone());
 
         // Out-of-order older states are useful as future bases, but must not
@@ -574,18 +573,14 @@ mod tests {
     }
 
     #[test]
-    fn numbered_state_queue_rejects_growth_instead_of_dropping_bases() {
+    fn numbered_state_queue_keeps_every_transport_accepted_base() {
         let mut view = TerminalView::new(2, 1);
         let empty = host_message(b"");
-        for state in 1..RECEIVED_STATE_CAP as u64 {
+        for state in 1..=(RECEIVED_STATE_CAP as u64 + 2) {
             view.apply_host_state(0, state, 0, &empty).unwrap();
         }
-        let err = view
-            .apply_host_state(0, RECEIVED_STATE_CAP as u64, 0, &empty)
-            .unwrap_err();
-        assert!(err.to_string().contains("queue is full"));
         assert!(view.remote_states.contains_key(&0));
-        assert_eq!(view.remote_states.len(), RECEIVED_STATE_CAP);
+        assert_eq!(view.remote_states.len(), RECEIVED_STATE_CAP + 3);
     }
 
     #[test]

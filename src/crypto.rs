@@ -245,15 +245,15 @@ impl Ocb {
         let mut offset = [0u8; BLOCK];
         let byte_shift = bottom >> 3;
         let bit_shift = bottom & 7;
-        for i in 0..BLOCK {
+        for (i, byte) in offset.iter_mut().enumerate() {
             let idx = byte_shift + i;
             if idx < 24 {
                 if bit_shift == 0 {
-                    offset[i] = stretch[idx];
+                    *byte = stretch[idx];
                 } else {
-                    offset[i] = stretch[idx].wrapping_shl(bit_shift as u32);
+                    *byte = stretch[idx].wrapping_shl(bit_shift as u32);
                     if idx + 1 < 24 {
-                        offset[i] |= stretch[idx + 1] >> (8 - bit_shift);
+                        *byte |= stretch[idx + 1] >> (8 - bit_shift);
                     }
                 }
             }

@@ -357,8 +357,10 @@ fn left_cell_attr_inherited_on_overlay() {
     let mut p = always_flagging();
     let mut fb = blank_fb();
     use crate::framebuffer::Attr;
-    let mut bold = Attr::default();
-    bold.bold = true;
+    let bold = Attr {
+        bold: true,
+        ..Attr::default()
+    };
     fb.put_rune(0, 0, 'P', bold);
     p.set_cursor(1, 0);
     p.keystroke(b"x", &fb);
@@ -978,7 +980,7 @@ fn adaptive_demote_clears_predictions_while_notification_stays_visible() {
 fn bulk_paste_does_not_clear_an_active_network_notification() {
     let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Always);
     let _ = pipe.set_notification(Some("mosh: Last contact 8 seconds ago.".to_string()));
-    let _ = pipe.on_keystroke(&vec![b'x'; 101]);
+    let _ = pipe.on_keystroke(&[b'x'; 101]);
     let shown = pipe.last_shown().unwrap();
     assert_eq!(shown.cell_at(0, 0).unwrap().ch, 'm');
     assert_eq!(shown.cell_at(1, 0).unwrap().ch, 'o');
@@ -1524,8 +1526,10 @@ fn correct_cascades_host_renditions_to_rest_of_row() {
     p.set_cursor(0, 0);
     p.keystroke(b"abc", &blank_fb());
     let mut host = blank_fb();
-    let mut bold = Attr::default();
-    bold.bold = true;
+    let bold = Attr {
+        bold: true,
+        ..Attr::default()
+    };
     host.put_rune(0, 0, 'a', bold);
     host.cur_x = 1;
     p.confirm(&host);
@@ -1542,8 +1546,10 @@ fn correct_cascades_host_renditions_to_rest_of_row() {
 fn correct_no_credit_does_not_prove_or_false_cascade_path() {
     let mut p = always();
     let mut host = blank_fb();
-    let mut bold = Attr::default();
-    bold.bold = true;
+    let bold = Attr {
+        bold: true,
+        ..Attr::default()
+    };
     host.put_rune(0, 0, 'a', bold);
     p.set_cursor(0, 0);
     p.become_tentative();
@@ -1574,8 +1580,10 @@ fn correct_cascade_same_row_only() {
     // Build two-row pending with same epoch via predict by host insert? Skip.
     // Direct: confirm 'a' bold; remaining 'b' on row0 gets bold; ensure no crash.
     let mut host = blank_fb();
-    let mut bold = Attr::default();
-    bold.bold = true;
+    let bold = Attr {
+        bold: true,
+        ..Attr::default()
+    };
     host.put_rune(0, 0, 'a', bold);
     host.cur_x = 1;
     p.confirm(&host);
@@ -1597,9 +1605,11 @@ fn correct_cascade_dim_and_fg() {
     p.set_cursor(0, 0);
     p.keystroke(b"xy", &blank_fb());
     let mut host = blank_fb();
-    let mut attr = Attr::default();
-    attr.dim = true;
-    attr.fg = crate::framebuffer::Color::index(2);
+    let attr = Attr {
+        dim: true,
+        fg: crate::framebuffer::Color::index(2),
+        ..Attr::default()
+    };
     host.put_rune(0, 0, 'x', attr);
     host.cur_x = 1;
     p.confirm(&host);
@@ -1620,8 +1630,10 @@ fn correct_cascade_survives_flagging_off() {
     p.set_cursor(0, 0);
     p.keystroke(b"ab", &blank_fb());
     let mut host = blank_fb();
-    let mut bold = Attr::default();
-    bold.bold = true;
+    let bold = Attr {
+        bold: true,
+        ..Attr::default()
+    };
     host.put_rune(0, 0, 'a', bold);
     host.cur_x = 1;
     p.confirm(&host);

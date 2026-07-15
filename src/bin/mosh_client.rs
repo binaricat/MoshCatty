@@ -67,6 +67,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .parse()
         .map_err(|_| format!("invalid port: {}", args[1]))?;
     let key = env::var("MOSH_KEY").map_err(|_| "MOSH_KEY environment variable is required")?;
+    env::remove_var("MOSH_KEY");
 
     let cols = env::var("COLUMNS")
         .ok()
@@ -79,7 +80,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(term_rows)
         .unwrap_or(24u16);
 
-    let mut client = Client::dial(&host, port, &key)?;
+    let mut client = Client::dial_with_size(&host, port, &key, cols, rows)?;
     client.resize(cols, rows);
 
     let running = Arc::new(AtomicBool::new(true));
@@ -123,6 +124,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Same-batch hoststring + echo_ack must not confirm against a stale FB
         // (that IncorrectOrExpires blank preds and permanently hides local echo).
         let _host_paint = client.poll()?;
+        let remote_shutdown = client.remote_shutdown_ack_sent();
         if client.remote_state_num() != last_remote_state_num {
             last_remote_state_num = client.remote_state_num();
             let out = display.on_host_frame(client.remote_framebuffer());
@@ -140,6 +142,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if !ack_paint.is_empty() {
             stdout.write_all(&ack_paint)?;
             stdout.flush()?;
+        }
+        // A shutdown state may carry the peer's final frame. Paint and confirm
+        // it before leaving the display loop.
+        if remote_shutdown {
+            break;
         }
 
         // mosh-go ExpireStale: tick even when the server is quiet.
@@ -198,6 +205,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         thread::sleep(Duration::from_millis(2));
+    }
+
+    if !client.is_dead() {
+        let _ = client.graceful_shutdown(Duration::from_secs(10));
     }
 
     Ok(())

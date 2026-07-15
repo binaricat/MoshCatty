@@ -66,10 +66,13 @@ impl Ocb {
     }
 
     pub fn from_base64(key_b64: &str) -> Result<Self> {
-        let mut s = key_b64.trim().to_string();
-        while s.len() % 4 != 0 {
-            s.push('=');
+        if key_b64.len() != 22 {
+            return Err(Error::InvalidKey(format!(
+                "mosh key must be exactly 22 base64 characters, got {}",
+                key_b64.len()
+            )));
         }
+        let s = format!("{key_b64}==");
         let raw = B64
             .decode(s.as_bytes())
             .map_err(|e| Error::InvalidKey(format!("base64: {e}")))?;
@@ -323,6 +326,13 @@ mod tests {
         let nonce = [0u8; 12];
         let ct = ocb.encrypt(&nonce, b"hi");
         assert_eq!(ocb.decrypt(&nonce, &ct).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn mosh_key_requires_the_official_22_character_form() {
+        assert!(Ocb::from_base64("AAAAAAAAAAAAAAAAAAAAAA==").is_err());
+        assert!(Ocb::from_base64(" AAAAAAAAAAAAAAAAAAAAAA ").is_err());
+        assert!(Ocb::from_base64("AAAAAAAAAAAAAAAAAAAAA!").is_err());
     }
 
     #[test]

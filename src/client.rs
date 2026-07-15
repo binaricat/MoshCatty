@@ -4,7 +4,8 @@
 //! (ANSI-like paint). Writing that stream to a real PTY/xterm is correct for
 //! Netcatty's node-pty sandwich and eliminates the Cygwin terminfo path.
 
-use std::net::{ToSocketAddrs, UdpSocket};
+use std::collections::VecDeque;
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
 use crate::crypto::Ocb;
@@ -15,12 +16,37 @@ use crate::transport::Transport;
 
 const TICK_INTERVAL: Duration = Duration::from_millis(8);
 const MAX_PAYLOAD: usize = 16384;
-/// Exit when no authenticated datagram has arrived for this long (stock-like).
-const NETWORK_TIMEOUT: Duration = Duration::from_secs(60);
+/// Stock mosh only times out the initial attachment; an established session
+/// remains resumable across long network outages.
+const INITIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const PORT_HOP_INTERVAL: Duration = Duration::from_secs(10);
+const MAX_OLD_SOCKET_AGE: Duration = Duration::from_secs(60);
+const MAX_PORTS_OPEN: usize = 10;
+const IPV6_FRAGMENT_PAYLOAD: usize = 1178;
+const FALLBACK_FRAGMENT_PAYLOAD: usize = 462;
+
+fn is_message_too_long(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::EMSGSIZE)
+    }
+    #[cfg(windows)]
+    {
+        // WSAEMSGSIZE from WinSock2.
+        error.raw_os_error() == Some(10040)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = error;
+        false
+    }
+}
 
 /// A connected mosh client session.
 pub struct Client {
-    socket: UdpSocket,
+    sockets: VecDeque<UdpSocket>,
+    remote_addr: SocketAddr,
+    last_port_choice: Instant,
     transport: Transport,
     terminal: TerminalView,
     actions: Vec<UserInstruction>,
@@ -37,6 +63,12 @@ pub struct Client {
 impl Client {
     /// Connect to a mosh-server endpoint.
     pub fn dial(host: &str, port: u16, key: &str) -> Result<Self> {
+        Self::dial_with_size(host, port, key, 80, 24)
+    }
+
+    /// Connect with the actual local terminal size so state 0 matches the
+    /// server-side terminal before the first resize instruction is applied.
+    pub fn dial_with_size(host: &str, port: u16, key: &str, cols: u16, rows: u16) -> Result<Self> {
         let ocb = Ocb::from_base64(key)?;
         let addr = (host, port)
             .to_socket_addrs()
@@ -44,21 +76,19 @@ impl Client {
             .next()
             .ok_or_else(|| Error::Other(format!("could not resolve {host}:{port}")))?;
 
-        let socket = UdpSocket::bind(if addr.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        })?;
-        socket.connect(addr)?;
-        socket.set_read_timeout(Some(Duration::from_millis(20)))?;
-        socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let socket = Self::open_socket(addr)?;
 
         let mut transport = Transport::new_client(ocb);
+        if addr.is_ipv6() {
+            transport.set_max_fragment_payload(IPV6_FRAGMENT_PAYLOAD);
+        }
         transport.force_next_send();
         let mut client = Self {
-            socket,
+            sockets: VecDeque::from([socket]),
+            remote_addr: addr,
+            last_port_choice: Instant::now(),
             transport,
-            terminal: TerminalView::new(80, 24),
+            terminal: TerminalView::new(cols, rows),
             actions: Vec::new(),
             acked_action_count: 0,
             last_acked: 0,
@@ -98,6 +128,34 @@ impl Client {
         self.dead_reason.as_deref()
     }
 
+    pub fn remote_shutdown_ack_sent(&self) -> bool {
+        self.transport.counterparty_shutdown_ack_sent()
+    }
+
+    /// Ask the peer to close the SSP session and keep pumping UDP until the
+    /// request is acknowledged or the caller's deadline expires.
+    pub fn graceful_shutdown(&mut self, timeout: Duration) -> Result<bool> {
+        if self.dead {
+            return Ok(false);
+        }
+        if self.remote_shutdown_ack_sent() {
+            return Ok(true);
+        }
+        self.transport.start_shutdown();
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let _ = self.poll()?;
+            if self.transport.shutdown_acknowledged() || self.remote_shutdown_ack_sent() {
+                return Ok(true);
+            }
+            if self.transport.shutdown_timed_out() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(self.transport.shutdown_acknowledged() || self.remote_shutdown_ack_sent())
+    }
+
     /// Smoothed RTT from the transport, if any sample is available.
     pub fn srtt(&self) -> Option<std::time::Duration> {
         self.transport.srtt()
@@ -134,44 +192,48 @@ impl Client {
 
         let mut paint = Vec::new();
         let mut buf = [0u8; MAX_PAYLOAD + 64];
-        loop {
-            match self.socket.recv(&mut buf) {
-                Ok(n) => {
-                    if let Some(state) = self.transport.recv_state(&buf[..n]) {
-                        let chunk = match self.terminal.apply_host_state(
-                            state.old_num,
-                            state.new_num,
-                            state.throwaway_num,
-                            &state.diff,
-                        ) {
-                            Ok(chunk) => chunk,
-                            Err(error) => {
-                                self.mark_dead("remote terminal state was rejected");
-                                return Err(error);
-                            }
-                        };
-                        paint.extend_from_slice(&chunk);
+        let mut received_datagram = false;
+        for socket in &self.sockets {
+            loop {
+                match socket.recv(&mut buf) {
+                    Ok(n) => {
+                        received_datagram = true;
+                        if let Some(state) = self.transport.recv_state(&buf[..n]) {
+                            let chunk = match self.terminal.apply_host_state(
+                                state.old_num,
+                                state.new_num,
+                                state.throwaway_num,
+                                &state.diff,
+                            ) {
+                                Ok(chunk) => chunk,
+                                Err(error) => {
+                                    self.mark_dead("remote terminal state was rejected");
+                                    return Err(error);
+                                }
+                            };
+                            paint.extend_from_slice(&chunk);
+                        }
                     }
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            || error.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break;
+                    }
+                    // A connected UDP socket can surface transient ICMP and
+                    // route errors here. Mosh must keep the session resumable.
+                    Err(_) => break,
                 }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    break;
-                }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::ConnectionRefused
-                        || e.kind() == std::io::ErrorKind::ConnectionReset =>
-                {
-                    self.mark_dead("network connection reset");
-                    break;
-                }
-                Err(e) => return Err(Error::Io(e)),
             }
         }
+        if received_datagram {
+            self.prune_old_sockets();
+        }
 
-        if self.transport.last_recv().elapsed() > NETWORK_TIMEOUT {
-            self.mark_dead("mosh did not hear from the server (network timeout)");
+        if !self.transport.has_received_authenticated()
+            && self.transport.last_recv().elapsed() > INITIAL_CONNECT_TIMEOUT
+        {
+            self.mark_dead("mosh did not hear from the server (initial connection timeout)");
             return Ok(paint);
         }
 
@@ -217,33 +279,76 @@ impl Client {
         self.dead_reason = Some(reason.to_string());
     }
 
+    fn open_socket(addr: SocketAddr) -> Result<UdpSocket> {
+        let socket = UdpSocket::bind(if addr.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        })?;
+        socket.connect(addr)?;
+        socket.set_nonblocking(true)?;
+        Ok(socket)
+    }
+
+    fn maybe_hop_port(&mut self) {
+        if self.last_port_choice.elapsed() < PORT_HOP_INTERVAL
+            || self.transport.last_roundtrip_success().elapsed() < PORT_HOP_INTERVAL
+        {
+            return;
+        }
+        // Opening a replacement socket is opportunistic. Keep the current
+        // sockets and retry later if the OS temporarily cannot allocate one.
+        self.last_port_choice = Instant::now();
+        let Ok(socket) = Self::open_socket(self.remote_addr) else {
+            return;
+        };
+        self.sockets.push_back(socket);
+        while self.sockets.len() > MAX_PORTS_OPEN {
+            self.sockets.pop_front();
+        }
+    }
+
+    fn prune_old_sockets(&mut self) {
+        if self.sockets.len() > 1 && self.last_port_choice.elapsed() > MAX_OLD_SOCKET_AGE {
+            if let Some(newest) = self.sockets.pop_back() {
+                self.sockets.clear();
+                self.sockets.push_back(newest);
+            }
+        }
+    }
+
     fn flush_ticks(&mut self) -> Result<()> {
         if self.dead {
             return Ok(());
         }
-        if self.dirty && self.transport.acked_by_remote() >= self.transport.sent_num() {
+        self.process_acks();
+        if self.dirty {
             self.dirty = false;
-            self.process_acks();
             let new_actions = self.actions[self.acked_action_count..].to_vec();
             if !new_actions.is_empty() {
                 let payload = UserInstruction::encode_message(&new_actions);
-                self.transport.set_pending(payload);
-                let next_num = self.transport.sent_num() + 1;
+                let next_num = self.transport.set_pending(payload);
                 self.sent_action_counts.push((next_num, self.actions.len()));
             }
         }
 
-        for dg in self.transport.tick() {
-            match self.socket.send(&dg) {
-                Ok(_) => {}
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::ConnectionRefused
-                        || e.kind() == std::io::ErrorKind::ConnectionReset =>
-                {
-                    self.mark_dead("network connection refused");
-                    return Ok(());
+        self.maybe_hop_port();
+        let datagrams = self.transport.tick();
+        if self.transport.crypto_exhausted() {
+            self.mark_dead("mosh session encryption limit reached");
+            return Ok(());
+        }
+        for dg in datagrams {
+            if let Some(socket) = self.sockets.back() {
+                // Like stock mosh, reportable UDP send failures do not end the
+                // session; a later port hop or route recovery can resume it.
+                if let Err(error) = socket.send(&dg) {
+                    if is_message_too_long(&error) {
+                        self.transport
+                            .set_max_fragment_payload(FALLBACK_FRAGMENT_PAYLOAD);
+                        break;
+                    }
                 }
-                Err(e) => return Err(Error::Io(e)),
             }
         }
         Ok(())
@@ -251,21 +356,32 @@ impl Client {
 
     fn process_acks(&mut self) {
         let acked = self.transport.acked_by_remote();
+        let rebase_required = self.transport.take_rebase_required();
         if acked > self.last_acked {
             self.last_acked = acked;
-            if acked >= self.transport.sent_num() {
-                if let Some(&(_, count)) = self.sent_action_counts.iter().find(|(n, _)| *n == acked)
-                {
-                    if count > self.acked_action_count {
-                        self.acked_action_count = count;
-                    }
+            if let Some(count) = self
+                .sent_action_counts
+                .iter()
+                .filter(|(state, _)| *state <= acked)
+                .map(|(_, count)| *count)
+                .max()
+            {
+                if count > self.acked_action_count {
+                    self.acked_action_count = count;
                 }
-                self.sent_action_counts.clear();
-                // Drop fully-acked keystroke history (long-session bound).
-                if self.acked_action_count > 0 && self.acked_action_count <= self.actions.len() {
-                    self.actions.drain(..self.acked_action_count);
-                    self.acked_action_count = 0;
+            }
+            self.sent_action_counts.retain(|(state, _)| *state > acked);
+            // Drop fully-acked keystroke history (long-session bound).
+            if self.acked_action_count > 0 && self.acked_action_count <= self.actions.len() {
+                let drained = self.acked_action_count;
+                self.actions.drain(..drained);
+                for (_, count) in &mut self.sent_action_counts {
+                    *count = count.saturating_sub(drained);
                 }
+                self.acked_action_count = 0;
+            }
+            if rebase_required && !self.actions.is_empty() {
+                self.dirty = true;
             }
         }
     }
@@ -275,7 +391,7 @@ impl Client {
 mod tests {
     use super::*;
     use crate::crypto::Ocb;
-    use crate::pb::HostInstruction;
+    use crate::pb::{HostInstruction, UserInstruction};
     use crate::transport::Transport;
     use std::net::UdpSocket;
     use std::sync::{Arc, Mutex};
@@ -456,5 +572,307 @@ mod tests {
             1,
             "parallel SSP branches must be reconstructed as states, not replayed as raw diffs: {plain:?}",
         );
+    }
+
+    #[test]
+    fn dial_initializes_remote_state_with_actual_terminal_size() {
+        let client = Client::dial_with_size("127.0.0.1", 9, "AAAAAAAAAAAAAAAAAAAAAA", 120, 40)
+            .expect("dial");
+
+        assert_eq!(client.remote_framebuffer().cols, 120);
+        assert_eq!(client.remote_framebuffer().rows, 40);
+    }
+
+    #[test]
+    fn graceful_shutdown_waits_for_peer_acknowledgement() {
+        let (port, key, _handle) = spawn_echo_server("shutdown");
+        let mut client = Client::dial("127.0.0.1", port, &key).expect("dial");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !client.transport.has_received_authenticated() && Instant::now() < deadline {
+            let _ = client.poll().unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(client.transport.has_received_authenticated());
+        assert!(client
+            .graceful_shutdown(Duration::from_secs(1))
+            .expect("shutdown"));
+    }
+
+    #[test]
+    fn later_keystrokes_are_sent_before_the_previous_state_is_acked() {
+        let key = [23u8; 16];
+        let key_b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .encode(key)
+                .trim_end_matches('=')
+                .to_string()
+        };
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let mut server = Transport::new_server(Ocb::new(&key).unwrap());
+        let mut client = Client::dial("127.0.0.1", port, &key_b64).unwrap();
+        let mut wire = [0u8; 4096];
+
+        let (n, client_addr) = socket.recv_from(&mut wire).expect("initial client state");
+        let _ = server.recv(&wire[..n]);
+        server.force_next_send();
+        for datagram in server.tick() {
+            socket.send_to(&datagram, client_addr).unwrap();
+        }
+        for _ in 0..20 {
+            let _ = client.poll().unwrap();
+            if client.acked_by_remote() > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        client.send_keys(b"a");
+        let deadline = Instant::now() + Duration::from_millis(400);
+        let mut first_keys = Vec::new();
+        while Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+            let _ = client.poll().unwrap();
+            if let Ok((n, _)) = socket.recv_from(&mut wire) {
+                if let Some(diff) = server.recv(&wire[..n]) {
+                    first_keys = UserInstruction::decode_message(&diff)
+                        .unwrap()
+                        .into_iter()
+                        .flat_map(|instruction| instruction.keys)
+                        .collect();
+                    if first_keys.contains(&b'a') {
+                        break;
+                    }
+                }
+            }
+        }
+        assert_eq!(first_keys, b"a");
+
+        // Deliberately withhold the ACK for `a`. Stock mosh still sends a
+        // newer state for `b` instead of serializing input by one full RTT.
+        client.send_keys(b"b");
+        let deadline = Instant::now() + Duration::from_millis(400);
+        let mut second_keys = Vec::new();
+        while Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+            let _ = client.poll().unwrap();
+            if let Ok((n, _)) = socket.recv_from(&mut wire) {
+                if let Some(diff) = server.recv(&wire[..n]) {
+                    second_keys = UserInstruction::decode_message(&diff)
+                        .unwrap()
+                        .into_iter()
+                        .flat_map(|instruction| instruction.keys)
+                        .collect();
+                    if second_keys.contains(&b'b') {
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(
+            second_keys.contains(&b'b'),
+            "second keystroke waited for the first state's ACK"
+        );
+    }
+
+    #[test]
+    fn latest_input_keeps_sending_after_thirty_two_unacknowledged_states() {
+        let key = [29u8; 16];
+        let key_b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .encode(key)
+                .trim_end_matches('=')
+                .to_string()
+        };
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let mut server = Transport::new_server(Ocb::new(&key).unwrap());
+        let mut client = Client::dial("127.0.0.1", port, &key_b64).unwrap();
+        let mut wire = [0u8; 16384];
+
+        let (n, client_addr) = socket.recv_from(&mut wire).expect("initial client state");
+        let _ = server.recv(&wire[..n]);
+        server.force_next_send();
+        for datagram in server.tick() {
+            socket.send_to(&datagram, client_addr).unwrap();
+        }
+        for _ in 0..20 {
+            let _ = client.poll().unwrap();
+            if client.acked_by_remote() > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let expected = (0..40).map(|i| b'a' + (i % 26) as u8).collect::<Vec<_>>();
+        let mut latest = Vec::new();
+        for byte in &expected {
+            client.send_keys(&[*byte]);
+            thread::sleep(Duration::from_millis(25));
+            let _ = client.poll().unwrap();
+            while let Ok((n, _)) = socket.recv_from(&mut wire) {
+                if let Some(diff) = server.recv(&wire[..n]) {
+                    latest = UserInstruction::decode_message(&diff)
+                        .unwrap()
+                        .into_iter()
+                        .flat_map(|instruction| instruction.keys)
+                        .collect();
+                }
+            }
+        }
+
+        assert!(client.sent_num() > 32);
+        assert_eq!(
+            latest, expected,
+            "new input stopped after the send window filled"
+        );
+    }
+
+    #[test]
+    fn early_ack_after_send_window_overflow_preserves_later_input() {
+        let key = [30u8; 16];
+        let key_b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .encode(key)
+                .trim_end_matches('=')
+                .to_string()
+        };
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let mut server = Transport::new_server(Ocb::new(&key).unwrap());
+        let mut client = Client::dial("127.0.0.1", port, &key_b64).unwrap();
+        let mut wire = [0u8; 16384];
+
+        let (n, client_addr) = socket.recv_from(&mut wire).expect("initial client state");
+        let _ = server.recv(&wire[..n]);
+        server.force_next_send();
+        for datagram in server.tick() {
+            socket.send_to(&datagram, client_addr).unwrap();
+        }
+        for _ in 0..20 {
+            let _ = client.poll().unwrap();
+            if client.acked_by_remote() > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        while socket.recv_from(&mut wire).is_ok() {}
+
+        let expected = (0..40).map(|i| b'A' + (i % 26) as u8).collect::<Vec<_>>();
+        let mut delivered_prefix = Vec::new();
+        for byte in &expected {
+            client.send_keys(&[*byte]);
+            thread::sleep(Duration::from_millis(25));
+            let _ = client.poll().unwrap();
+            while let Ok((n, _)) = socket.recv_from(&mut wire) {
+                if delivered_prefix.is_empty() {
+                    if let Some(diff) = server.recv(&wire[..n]) {
+                        delivered_prefix = UserInstruction::decode_message(&diff)
+                            .unwrap()
+                            .into_iter()
+                            .flat_map(|instruction| instruction.keys)
+                            .collect::<Vec<_>>();
+                    }
+                }
+                // Drop every later client state to model a one-way path that
+                // delivered only the first input before the send queue filled.
+            }
+        }
+        assert!(!delivered_prefix.is_empty());
+        assert!(client.sent_num() > 32);
+
+        server.force_next_send();
+        for datagram in server.tick() {
+            socket.send_to(&datagram, client_addr).unwrap();
+        }
+        let ack_deadline = Instant::now() + Duration::from_secs(1);
+        while client.acked_by_remote() < server.ack_num() && Instant::now() < ack_deadline {
+            let _ = client.poll().unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut latest = Vec::new();
+        while Instant::now() < deadline && latest != expected {
+            let _ = client.poll().unwrap();
+            while let Ok((n, _)) = socket.recv_from(&mut wire) {
+                if let Some(diff) = server.recv(&wire[..n]) {
+                    latest = UserInstruction::decode_message(&diff)
+                        .unwrap()
+                        .into_iter()
+                        .flat_map(|instruction| instruction.keys)
+                        .collect();
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        delivered_prefix.extend_from_slice(&latest);
+        assert_eq!(
+            delivered_prefix, expected,
+            "partial ACK discarded cumulative input after send-window overflow"
+        );
+    }
+
+    #[test]
+    fn remote_shutdown_state_keeps_its_final_host_frame() {
+        let key = [31u8; 16];
+        let key_b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .encode(key)
+                .trim_end_matches('=')
+                .to_string()
+        };
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let mut server = Transport::new_server(Ocb::new(&key).unwrap());
+        let mut client = Client::dial("127.0.0.1", port, &key_b64).unwrap();
+        let mut wire = [0u8; 4096];
+
+        let (n, client_addr) = socket.recv_from(&mut wire).expect("initial client state");
+        let _ = server.recv(&wire[..n]);
+        let final_frame = HostInstruction::encode_message(&[HostInstruction {
+            hoststring: b"\x1b[HFINAL".to_vec(),
+            width: 0,
+            height: 0,
+            echo_ack_num: -1,
+        }]);
+        server.set_pending(final_frame);
+        server.start_shutdown();
+        for datagram in server.tick() {
+            socket.send_to(&datagram, client_addr).unwrap();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while client.remote_state_num() != u64::MAX && Instant::now() < deadline {
+            let _ = client.poll().unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        let framebuffer = client.remote_framebuffer();
+        let rendered = (0..5)
+            .map(|x| framebuffer.cell_at(x, 0).unwrap().ch)
+            .collect::<String>();
+        assert_eq!(rendered, "FINAL");
+
+        thread::sleep(Duration::from_millis(10));
+        let _ = client.poll().unwrap();
+        assert!(client.remote_shutdown_ack_sent());
     }
 }

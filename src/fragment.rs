@@ -54,6 +54,11 @@ impl Fragment {
 
 /// Split a compressed instruction into fragments.
 pub fn fragmentize(id: u64, data: &[u8]) -> Vec<Fragment> {
+    fragmentize_with_payload(id, data, MAX_FRAGMENT_PAYLOAD)
+}
+
+pub fn fragmentize_with_payload(id: u64, data: &[u8], max_payload: usize) -> Vec<Fragment> {
+    let max_payload = max_payload.max(1);
     if data.is_empty() {
         return vec![Fragment {
             id,
@@ -62,11 +67,11 @@ pub fn fragmentize(id: u64, data: &[u8]) -> Vec<Fragment> {
             payload: vec![],
         }];
     }
-    let n = (data.len() + MAX_FRAGMENT_PAYLOAD - 1) / MAX_FRAGMENT_PAYLOAD;
+    let n = data.len().div_ceil(max_payload);
     let mut frags = Vec::with_capacity(n);
     for i in 0..n {
-        let start = i * MAX_FRAGMENT_PAYLOAD;
-        let end = (start + MAX_FRAGMENT_PAYLOAD).min(data.len());
+        let start = i * max_payload;
+        let end = (start + max_payload).min(data.len());
         frags.push(Fragment {
             id,
             fragment_num: i as u16,

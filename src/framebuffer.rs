@@ -859,9 +859,7 @@ fn append_terminal_metadata(
         }
     }
     if next.clipboard.as_deref() != old.and_then(|fb| fb.clipboard.as_deref()) {
-        if let Some(clipboard) = next.clipboard.as_deref() {
-            append_osc(buf, b"52;c;", clipboard);
-        }
+        append_osc(buf, b"52;c;", next.clipboard.as_deref().unwrap_or_default());
     }
 
     append_private_mode_diff(
@@ -1186,6 +1184,16 @@ mod tests {
             !paint.windows(5).any(|window| window == b"\x1b]52;"),
             "resize must not rewrite an unchanged remote clipboard"
         );
+    }
+
+    #[test]
+    fn diff_clears_a_remote_clipboard_value() {
+        let mut old = Framebuffer::new(10, 5);
+        old.clipboard = Some(b"YQ==".to_vec());
+        let mut next = old.clone();
+        next.clipboard = None;
+
+        assert_eq!(next.diff(Some(&old)), b"\x1b]52;c;\x07");
     }
 
     #[test]

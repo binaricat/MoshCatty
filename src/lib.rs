@@ -20,6 +20,7 @@ pub mod ansi_apply;
 pub mod client;
 pub mod crypto;
 pub mod display;
+pub(crate) mod ecn;
 pub mod error;
 pub mod fragment;
 pub mod framebuffer;
@@ -28,7 +29,7 @@ pub mod prediction;
 pub mod terminal;
 pub mod transport;
 
-pub use client::Client;
+pub use client::{Client, ConnectionStatus};
 pub use crypto::Ocb;
 pub use error::{Error, Result};
 pub use framebuffer::Framebuffer;

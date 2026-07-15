@@ -14,7 +14,10 @@ pub const FRAGMENT_FINAL_BIT: u16 = 0x8000;
 /// Upstream: get_MTU() - ADDED_BYTES(12) - OCB(16) - frag_header(10) ≈ 1214 on
 /// IPv4 path MTU 1280. Prefer that over mosh-go's 1300 to avoid IP fragmentation.
 pub const MAX_FRAGMENT_PAYLOAD: usize = 1214;
-const MAX_REASSEMBLED: usize = 1 << 20;
+/// Official Mosh's compressor and decompressor each use a 2048×2048-byte
+/// buffer. Accept the same complete-instruction boundary while still
+/// rejecting unbounded fragment accumulation.
+pub const MAX_INSTRUCTION_BYTES: usize = 2048 * 2048;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fragment {
@@ -54,6 +57,15 @@ impl Fragment {
 
 /// Split a compressed instruction into fragments.
 pub fn fragmentize(id: u64, data: &[u8]) -> Vec<Fragment> {
+    fragmentize_with_payload(id, data, MAX_FRAGMENT_PAYLOAD)
+}
+
+pub fn fragmentize_with_payload(id: u64, data: &[u8], max_payload: usize) -> Vec<Fragment> {
+    let max_payload = max_payload.max(1);
+    let fragment_count = data.len().max(1).div_ceil(max_payload);
+    if fragment_count > 0x8000 {
+        return Vec::new();
+    }
     if data.is_empty() {
         return vec![Fragment {
             id,
@@ -62,11 +74,11 @@ pub fn fragmentize(id: u64, data: &[u8]) -> Vec<Fragment> {
             payload: vec![],
         }];
     }
-    let n = (data.len() + MAX_FRAGMENT_PAYLOAD - 1) / MAX_FRAGMENT_PAYLOAD;
+    let n = data.len().div_ceil(max_payload);
     let mut frags = Vec::with_capacity(n);
     for i in 0..n {
-        let start = i * MAX_FRAGMENT_PAYLOAD;
-        let end = (start + MAX_FRAGMENT_PAYLOAD).min(data.len());
+        let start = i * max_payload;
+        let end = (start + max_payload).min(data.len());
         frags.push(Fragment {
             id,
             fragment_num: i as u16,
@@ -93,9 +105,6 @@ impl Assembler {
 
     /// Add a fragment; returns complete message when all pieces arrived.
     pub fn add(&mut self, f: Fragment) -> Option<Vec<u8>> {
-        if self.has_id && f.id < self.current_id {
-            return None; // stale
-        }
         if !self.has_id || f.id != self.current_id {
             self.current_id = f.id;
             self.has_id = true;
@@ -112,7 +121,7 @@ impl Assembler {
         let is_new_slot = self.fragments[idx].is_none();
         if is_new_slot {
             self.total_size = self.total_size.saturating_add(f.payload.len());
-            if self.total_size > MAX_REASSEMBLED {
+            if self.total_size > MAX_INSTRUCTION_BYTES {
                 self.fragments.clear();
                 self.total_num = None;
                 self.total_size = 0;
@@ -272,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn assembler_stale_id_dropped() {
+    fn assembler_accepts_a_complete_older_instruction_like_stock() {
         let mut a = Assembler::new();
         assert!(a
             .add(Fragment {
@@ -282,14 +291,16 @@ mod tests {
                 payload: b"five".to_vec(),
             })
             .is_some());
-        assert!(a
-            .add(Fragment {
+        assert_eq!(
+            a.add(Fragment {
                 id: 3,
                 fragment_num: 0,
                 is_final: true,
                 payload: b"three".to_vec(),
             })
-            .is_none());
+            .unwrap(),
+            b"three"
+        );
     }
 
     #[test]
@@ -379,5 +390,46 @@ mod tests {
             }
         }
         assert_eq!(out.unwrap(), payload);
+    }
+
+    #[test]
+    fn assembler_accepts_official_compressed_states_larger_than_one_mibibyte() {
+        let payload = vec![0x5a; (1 << 20) + MAX_FRAGMENT_PAYLOAD];
+        let mut assembler = Assembler::new();
+        let mut assembled = None;
+
+        for fragment in fragmentize(77, &payload) {
+            if let Some(message) = assembler.add(fragment) {
+                assembled = Some(message);
+            }
+        }
+
+        let assembled = assembled.expect("official-size state should reassemble");
+        assert_eq!(assembled.len(), payload.len());
+        assert!(
+            assembled == payload,
+            "reassembled payload must remain exact"
+        );
+    }
+
+    #[test]
+    fn assembler_rejects_states_larger_than_the_official_boundary() {
+        let payload = vec![0x5b; MAX_INSTRUCTION_BYTES + 1];
+        let mut assembler = Assembler::new();
+        let mut assembled = None;
+
+        for fragment in fragmentize(78, &payload) {
+            if let Some(message) = assembler.add(fragment) {
+                assembled = Some(message);
+            }
+        }
+
+        assert!(assembled.is_none());
+    }
+
+    #[test]
+    fn fragment_numbers_never_wrap_past_the_wire_field() {
+        let payload = vec![0x5c; 0x8001];
+        assert!(fragmentize_with_payload(79, &payload, 1).is_empty());
     }
 }

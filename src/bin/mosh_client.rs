@@ -22,6 +22,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use moshcatty::{Client, DisplayPipeline, DisplayPreference};
+use zeroize::Zeroize;
 
 fn main() {
     if let Err(e) = run() {
@@ -30,7 +31,29 @@ fn main() {
     }
 }
 
+/// Match stock mosh-client's early process hardening: a crash must not write
+/// the session key or decrypted terminal contents into a Unix core file.
+#[cfg(unix)]
+fn disable_core_dumps() -> io::Result<()> {
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    limit.rlim_cur = 0;
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn disable_core_dumps() -> io::Result<()> {
+    Ok(())
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    disable_core_dumps()?;
+
     #[cfg(all(windows, debug_assertions, feature = "conpty-test-probe"))]
     if env::var_os("MOSHCATTY_CONPTY_TEST").is_some() {
         return run_conpty_input_probe();
@@ -66,7 +89,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let port: u16 = args[1]
         .parse()
         .map_err(|_| format!("invalid port: {}", args[1]))?;
-    let key = env::var("MOSH_KEY").map_err(|_| "MOSH_KEY environment variable is required")?;
+    let mut key = env::var("MOSH_KEY").map_err(|_| "MOSH_KEY environment variable is required")?;
+    env::remove_var("MOSH_KEY");
+    let fallback_host = env::var("MOSH_FALLBACK_HOST").ok();
+    env::remove_var("MOSH_FALLBACK_HOST");
 
     let cols = env::var("COLUMNS")
         .ok()
@@ -79,8 +105,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(term_rows)
         .unwrap_or(24u16);
 
-    let mut client = Client::dial(&host, port, &key)?;
-    client.resize(cols, rows);
+    let mut hosts = vec![host.as_str()];
+    if let Some(fallback) = fallback_host.as_deref().filter(|value| *value != host) {
+        hosts.push(fallback);
+    }
+    let client_result = Client::dial_candidates_with_size(&hosts, port, &key, cols, rows);
+    key.zeroize();
+    let mut client = client_result?;
 
     let running = Arc::new(AtomicBool::new(true));
     install_signal_flag(running.clone());
@@ -100,9 +131,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // predicted glyphs beside HostBytes (Netcatty #2121).
     let mut display =
         DisplayPipeline::new(cols as usize, rows as usize, DisplayPreference::from_env());
+    let mut local_escape = LocalEscape::from_env();
     let mut last_resize_check = Instant::now();
     let mut cur_cols = cols;
     let mut cur_rows = rows;
+    let mut last_remote_state_num = 0;
+    let mut last_notification = None;
 
     while running.load(Ordering::SeqCst) {
         if client.is_dead() {
@@ -112,7 +146,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        let mode_paint = display.set_srtt(client.send_interval().or_else(|| client.srtt()));
+        let mode_paint = display.set_srtt(Some(client.send_interval()));
         if !mode_paint.is_empty() {
             stdout.write_all(&mode_paint)?;
             stdout.flush()?;
@@ -121,9 +155,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Poll first so host_fb is updated before late_ack Confirm.
         // Same-batch hoststring + echo_ack must not confirm against a stale FB
         // (that IncorrectOrExpires blank preds and permanently hides local echo).
-        let host_paint = client.poll()?;
-        if !host_paint.is_empty() {
-            let out = display.on_host_bytes(&host_paint);
+        let _host_paint = client.poll()?;
+        let remote_shutdown = client.remote_shutdown_ack_sent();
+        if client.remote_state_num() != last_remote_state_num {
+            last_remote_state_num = client.remote_state_num();
+            let out = display.on_host_frame(client.remote_framebuffer());
             if !out.is_empty() {
                 stdout.write_all(&out)?;
                 stdout.flush()?;
@@ -140,7 +176,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             stdout.flush()?;
         }
 
-        // mosh-go ExpireStale: tick even when the server is quiet.
+        let notification = local_escape.help_message().map(str::to_owned).or_else(|| {
+            client.connection_status().message(port).map(|mut message| {
+                if let Some(hint) = local_escape.quit_hint() {
+                    message.push_str(hint);
+                }
+                message
+            })
+        });
+        if notification != last_notification {
+            let notification_paint = display.set_notification(notification.clone());
+            if !notification_paint.is_empty() {
+                stdout.write_all(&notification_paint)?;
+                stdout.flush()?;
+            }
+            last_notification = notification;
+        }
+        // A shutdown state may carry the peer's final frame. Paint and confirm
+        // it before leaving the display loop.
+        if remote_shutdown {
+            break;
+        }
+
+        // Sample long-pending predictions even when the server is quiet.
         let tick_paint = display.tick(Instant::now());
         if !tick_paint.is_empty() {
             stdout.write_all(&tick_paint)?;
@@ -149,23 +207,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         match stdin_rx.try_recv() {
             Ok(Some(buf)) if !buf.is_empty() => {
-                let local = display.on_keystroke(&buf);
+                let input = local_escape.process(&buf);
+                let local = display.on_keystroke(&input.forward);
                 if !local.is_empty() {
                     stdout.write_all(&local)?;
                     stdout.flush()?;
                 }
-                client.send_keys(&buf);
+                client.send_keys(&input.forward);
+                if input.quit {
+                    let exiting = Some("mosh: Exiting on user request...".to_string());
+                    let paint = display.set_notification(exiting);
+                    if !paint.is_empty() {
+                        stdout.write_all(&paint)?;
+                        stdout.flush()?;
+                    }
+                    break;
+                }
             }
             Ok(None) => {
                 // EOF: drain remaining paint briefly then exit (PTY closed).
                 let deadline = Instant::now() + Duration::from_secs(2);
                 while Instant::now() < deadline && !client.is_dead() {
-                    let host_paint = client.poll()?;
-                    if host_paint.is_empty() {
+                    let _host_paint = client.poll()?;
+                    if client.remote_state_num() == last_remote_state_num {
                         thread::sleep(Duration::from_millis(10));
                         continue;
                     }
-                    let out = display.on_host_bytes(&host_paint);
+                    last_remote_state_num = client.remote_state_num();
+                    let out = display.on_host_frame(client.remote_framebuffer());
                     if !out.is_empty() {
                         stdout.write_all(&out)?;
                         stdout.flush()?;
@@ -195,6 +264,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         thread::sleep(Duration::from_millis(2));
+    }
+
+    if !client.is_dead() {
+        let _ = client.graceful_shutdown(Duration::from_secs(10));
     }
 
     Ok(())
@@ -232,7 +305,7 @@ const DISPLAY_OPEN: &[u8] = b"\x1b[?1049h\x1b[?1h";
 /// Stock mosh `Display::close()`: leave app-cursor / reset SGR / show cursor /
 /// disable common mouse modes / leave alternate screen (rmcup).
 const DISPLAY_CLOSE: &[u8] = b"\x1b[?1l\x1b[0m\x1b[?25h\
-\x1b[?1003l\x1b[?1002l\x1b[?1001l\x1b[?1000l\
+\x1b[?1003l\x1b[?1002l\x1b[?1001l\x1b[?1000l\x1b[?9l\
 \x1b[?1015l\x1b[?1006l\x1b[?1005l\
 \x1b[?1049l";
 
@@ -300,6 +373,148 @@ fn spawn_stdin_reader() -> Receiver<Option<Vec<u8>>> {
 fn print_usage() {
     eprintln!("Usage: MOSH_KEY=<key> mosh-client <host> <port>");
     eprintln!("Pure Rust Mosh client (Netcatty). No Cygwin / terminfo required.");
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LocalInput {
+    forward: Vec<u8>,
+    quit: bool,
+}
+
+/// Stock mosh's local escape command, adapted for a cross-platform child PTY.
+/// Quit and literal-escape are supported everywhere. Process suspension is
+/// intentionally omitted because stopping a ConPTY child can freeze its host.
+struct LocalEscape {
+    escape_key: Option<u8>,
+    pass_key: u8,
+    pass_key2: u8,
+    requires_line_start: bool,
+    line_start: bool,
+    pending: bool,
+    help: Option<String>,
+    quit_hint: Option<String>,
+}
+
+impl LocalEscape {
+    fn from_env() -> Self {
+        let value = env::var("MOSH_ESCAPE_KEY").ok();
+        Self::from_value(value.as_deref())
+    }
+
+    fn from_value(value: Option<&str>) -> Self {
+        let configured = match value {
+            Some("") => None,
+            Some(value) if value.len() == 1 && value.as_bytes()[0] < 128 => {
+                Some(value.as_bytes()[0])
+            }
+            Some(_) | None => Some(0x1e),
+        };
+        let escape_key = match configured {
+            Some(0x03 | 0x04 | 0x0a | 0x0c | 0x0d | 0x00) => Some(0x1e),
+            other => other,
+        };
+
+        let (pass_key, pass_key2, requires_line_start, help, quit_hint) =
+            if let Some(key) = escape_key {
+                let pass = if key < 32 { key + b'@' } else { key };
+                let pass2 = if pass.is_ascii_uppercase() {
+                    pass.to_ascii_lowercase()
+                } else {
+                    pass
+                };
+                let key_name = if key < 32 {
+                    format!("Ctrl-{}", pass as char)
+                } else {
+                    format!("\"{}\"", key as char)
+                };
+                (
+                    pass,
+                    pass2,
+                    key >= 32,
+                    Some(format!(
+                        "mosh: Commands: \".\" quits, \"{}\" gives literal {}",
+                        pass as char, key_name
+                    )),
+                    Some(format!(" [To quit: {key_name} .]")),
+                )
+            } else {
+                (0, 0, false, None, None)
+            };
+
+        Self {
+            escape_key,
+            pass_key,
+            pass_key2,
+            requires_line_start,
+            // Stock starts with lf_entered=false. Printable escape keys only
+            // become commands after the user actually enters a newline.
+            line_start: false,
+            pending: false,
+            help,
+            quit_hint,
+        }
+    }
+
+    fn process(&mut self, input: &[u8]) -> LocalInput {
+        let mut forward = Vec::with_capacity(input.len());
+        for &byte in input {
+            if self.pending {
+                self.pending = false;
+                if byte == b'.' {
+                    return LocalInput {
+                        forward,
+                        quit: true,
+                    };
+                }
+                // Stock suspends the local Unix process here. MoshCatty runs
+                // as a managed PTY child on every platform, so consume the
+                // command without forwarding Ctrl-Z to the remote shell.
+                if byte == 0x1a {
+                    self.line_start = false;
+                    continue;
+                }
+                if byte == self.pass_key || byte == self.pass_key2 {
+                    if let Some(key) = self.escape_key {
+                        forward.push(key);
+                    }
+                } else {
+                    if let Some(key) = self.escape_key {
+                        forward.push(key);
+                    }
+                    forward.push(byte);
+                }
+                // Starting an escape command clears stock's `lf_entered`.
+                // Its second byte never re-arms line-start detection, even
+                // when that byte itself is CR/LF.
+                continue;
+            }
+
+            if self.escape_key == Some(byte) && (!self.requires_line_start || self.line_start) {
+                self.pending = true;
+                self.line_start = false;
+                continue;
+            }
+
+            forward.push(byte);
+            self.line_start = byte == b'\n' || byte == b'\r';
+        }
+        LocalInput {
+            forward,
+            quit: false,
+        }
+    }
+
+    fn help_message(&self) -> Option<&str> {
+        if self.pending {
+            self.help.as_deref()
+        } else {
+            None
+        }
+    }
+
+    fn quit_hint(&self) -> Option<&str> {
+        self.quit_hint.as_deref()
+    }
 }
 
 #[cfg(unix)]
@@ -621,6 +836,102 @@ fn install_signal_flag(running: Arc<AtomicBool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn core_dump_limit_is_disabled_like_stock_mosh() {
+        struct CoreLimitGuard(libc::rlimit);
+        impl Drop for CoreLimitGuard {
+            fn drop(&mut self) {
+                let _ = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &self.0) };
+            }
+        }
+
+        let mut original: libc::rlimit = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut original) },
+            0
+        );
+        let _restore = CoreLimitGuard(original);
+
+        disable_core_dumps().expect("disable core dumps");
+        let mut hardened: libc::rlimit = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut hardened) },
+            0
+        );
+        assert_eq!(hardened.rlim_cur, 0);
+    }
+
+    #[test]
+    fn default_local_escape_quits_without_forwarding_control_bytes() {
+        let mut escape = LocalEscape::from_value(None);
+        let first = escape.process(b"ab\x1e");
+        assert_eq!(first.forward, b"ab");
+        assert!(!first.quit);
+        assert!(escape.help_message().is_some());
+
+        let second = escape.process(b".discarded");
+        assert!(second.quit);
+        assert!(second.forward.is_empty());
+        assert!(escape.help_message().is_none());
+    }
+
+    #[test]
+    fn local_escape_preserves_ordinary_bytes_before_quit_in_the_same_read() {
+        let mut escape = LocalEscape::from_value(None);
+        let result = escape.process(b"echo ready\x1e.");
+        assert!(result.quit);
+        assert_eq!(result.forward, b"echo ready");
+    }
+
+    #[test]
+    fn default_local_escape_can_send_a_literal_escape_or_unknown_sequence() {
+        let mut escape = LocalEscape::from_value(None);
+        assert_eq!(escape.process(b"\x1e^").forward, b"\x1e");
+        assert_eq!(escape.process(b"\x1ex").forward, b"\x1ex");
+    }
+
+    #[test]
+    fn local_suspend_command_is_not_forwarded_to_the_remote_shell() {
+        let mut escape = LocalEscape::from_value(None);
+        let result = escape.process(b"\x1e\x1a");
+        assert!(!result.quit);
+        assert!(result.forward.is_empty());
+    }
+
+    #[test]
+    fn empty_escape_setting_disables_local_commands() {
+        let mut escape = LocalEscape::from_value(Some(""));
+        let result = escape.process(b"\x1e.");
+        assert_eq!(result.forward, b"\x1e.");
+        assert!(!result.quit);
+        assert!(escape.quit_hint().is_none());
+    }
+
+    #[test]
+    fn printable_custom_escape_only_starts_after_a_newline() {
+        let mut escape = LocalEscape::from_value(Some("~"));
+        assert_eq!(escape.process(b"~.").forward, b"~.");
+        assert_eq!(escape.process(b"x~.").forward, b"x~.");
+        assert!(!escape.process(b"\n~").quit);
+        assert!(escape.help_message().is_some());
+        assert!(escape.process(b".").quit);
+    }
+
+    #[test]
+    fn newline_as_escape_command_payload_does_not_rearm_printable_escape() {
+        let mut escape = LocalEscape::from_value(Some("~"));
+        let result = escape.process(b"\n~\n~.");
+        assert!(!result.quit);
+        assert_eq!(result.forward, b"\n~\n~.");
+    }
+
+    #[test]
+    fn unsafe_custom_control_escape_falls_back_to_ctrl_caret() {
+        let escape = LocalEscape::from_value(Some("\x03"));
+        assert_eq!(escape.quit_hint(), Some(" [To quit: Ctrl-^ .]"));
+    }
 
     #[test]
     fn windows_vt_raw_mode_preserves_shortcut_escape_sequences() {

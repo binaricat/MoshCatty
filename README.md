@@ -66,8 +66,12 @@ Peer products either skip Windows Mosh or own a private engine. MoshCatty is the
 - **Cross-platform**: Linux / macOS / Windows (no Cygwin runtime)
 - **Drop-in CLI**: `MOSH_KEY=<key> mosh-client <host> <port>`
 - **Speculative local echo** (stock overlay rules on a mosh-go Diff path):
-  host_fb → Confirm → Overlay → Diff (`MOSH_PREDICTION_DISPLAY=adaptive|always|never`).
+  host_fb → Confirm → Overlay → Diff (`MOSH_PREDICTION_DISPLAY=adaptive|always|never|experimental`).
   See `docs/prediction.md`.
+- **Recoverable-outage status**: stock-style connecting / last-contact /
+  last-reply notification bar, cleared automatically after the path recovers
+- **Local escape command**: `Ctrl-^ .` quits and `Ctrl-^ ^` sends a literal
+  `Ctrl-^`, with `MOSH_ESCAPE_KEY` configuration
 - **Library API** (`moshcatty` crate) for embedders
 - **RFC 7253** AES-128-OCB3 + mosh-go interop vectors in CI
 - **Netcatty-ready**: fits existing SSH bootstrap + node-pty swap
@@ -127,6 +131,10 @@ mosh-client 192.0.2.10 60001
 | Variable | Meaning |
 |----------|---------|
 | `MOSH_KEY` | **Required.** Session key from `MOSH CONNECT` |
+| `MOSH_PREDICTION_DISPLAY` | `adaptive` (default), `always`, `never`, or `experimental` |
+| `MOSH_PREDICTION_OVERWRITE` | `yes` to predict overwrite-mode input |
+| `MOSH_ESCAPE_KEY` | One ASCII byte for the local command prefix; empty disables it (default `Ctrl-^`) |
+| `MOSH_NO_TERM_INIT` | Skip local alternate-screen setup (Netcatty sets this) |
 | `COLUMNS` / `LINES` | Initial / fallback terminal size |
 | (Unix) live winsize | Polled via `TIOCGWINSZ` |
 | (Windows) console size | Polled via `GetConsoleScreenBufferInfo` |
@@ -158,6 +166,13 @@ flags analogous to Unix `cfmakeraw` (ISIG off). Result: Ctrl+C interrupts the
 MoshCatty also enables virtual-terminal input before reading stdin. This keeps
 the escape sequences that ConPTY receives from terminal hosts intact, including
 arrow keys, Ctrl/Alt-modified arrows, and Alt shortcuts.
+
+The local Mosh command prefix works under ConPTY as well: `Ctrl-^ .` closes the
+Mosh session, and `Ctrl-^ ^` sends a literal `Ctrl-^` to the remote program.
+MoshCatty deliberately does not implement stock Mosh's Unix job-control suspend
+command because suspending a child ConPTY can also stall its host application;
+that local command is consumed and is never forwarded as Ctrl-Z to the remote
+shell.
 
 ### Windows CRT (no VC++ redistributable)
 

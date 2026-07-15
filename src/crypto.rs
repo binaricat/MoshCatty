@@ -9,6 +9,7 @@
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::Aes128;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::{Error, Result};
 
@@ -32,6 +33,18 @@ pub struct Ocb {
     l_dollar: [u8; BLOCK],
     l: [[u8; BLOCK]; 32],
 }
+
+impl Drop for Ocb {
+    fn drop(&mut self) {
+        // `aes/zeroize` clears both expanded AES key schedules. Clear the
+        // derived OCB masks owned by this wrapper as well.
+        self.l_star.zeroize();
+        self.l_dollar.zeroize();
+        self.l.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for Ocb {}
 
 impl Ocb {
     pub fn new(key: &[u8]) -> Result<Self> {
@@ -66,13 +79,17 @@ impl Ocb {
     }
 
     pub fn from_base64(key_b64: &str) -> Result<Self> {
-        let mut s = key_b64.trim().to_string();
-        while s.len() % 4 != 0 {
-            s.push('=');
+        if key_b64.len() != 22 {
+            return Err(Error::InvalidKey(format!(
+                "mosh key must be exactly 22 base64 characters, got {}",
+                key_b64.len()
+            )));
         }
-        let raw = B64
-            .decode(s.as_bytes())
-            .map_err(|e| Error::InvalidKey(format!("base64: {e}")))?;
+        let s = Zeroizing::new(format!("{key_b64}=="));
+        let raw = Zeroizing::new(
+            B64.decode(s.as_bytes())
+                .map_err(|e| Error::InvalidKey(format!("base64: {e}")))?,
+        );
         Self::new(&raw)
     }
 
@@ -302,6 +319,12 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ocb_key_schedule_and_derived_masks_are_zeroized_on_drop() {
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<Ocb>();
+    }
     use rand::RngCore;
 
     #[test]
@@ -323,6 +346,13 @@ mod tests {
         let nonce = [0u8; 12];
         let ct = ocb.encrypt(&nonce, b"hi");
         assert_eq!(ocb.decrypt(&nonce, &ct).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn mosh_key_requires_the_official_22_character_form() {
+        assert!(Ocb::from_base64("AAAAAAAAAAAAAAAAAAAAAA==").is_err());
+        assert!(Ocb::from_base64(" AAAAAAAAAAAAAAAAAAAAAA ").is_err());
+        assert!(Ocb::from_base64("AAAAAAAAAAAAAAAAAAAAA!").is_err());
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! last_shown cells, paint bytes, flagging, demote, and double-paint safety.
 
 use super::*;
-use crate::framebuffer::Attr;
+use crate::framebuffer::{Attr, Color};
 use std::time::{Duration, Instant};
 
 fn blank_fb() -> Framebuffer {
@@ -69,6 +69,40 @@ fn env_preference_parsing() {
     );
 }
 
+#[test]
+fn experimental_preference_is_recognized_and_shows_immediately() {
+    assert_eq!(
+        DisplayPreference::from_env_value("experimental"),
+        DisplayPreference::Experimental
+    );
+
+    let mut predictor = Predictor::new(DisplayPreference::Experimental);
+    predictor.keystroke(b"ab", &blank_fb());
+    let mut shown = blank_fb();
+    predictor.overlay(&mut shown);
+
+    assert!(predictor.should_show());
+    assert_eq!(shown.cell_at(0, 0).unwrap().ch, 'a');
+    assert_eq!(shown.cell_at(1, 0).unwrap().ch, 'b');
+}
+
+#[test]
+fn experimental_mismatch_drops_only_the_failed_prediction() {
+    let mut predictor = Predictor::new(DisplayPreference::Experimental);
+    let blank = blank_fb();
+    predictor.keystroke(b"a", &blank);
+    predictor.set_frames(1, 0, 0);
+    predictor.keystroke(b"b", &blank);
+
+    let mut host = blank_fb();
+    host.put_rune(0, 0, 'X', Attr::default());
+    predictor.set_frames(1, 1, 1);
+    predictor.confirm(&host);
+
+    assert_eq!(predictor.pending_known_char_at(0, 0), None);
+    assert_eq!(predictor.pending_known_char_at(1, 0), Some('b'));
+}
+
 // ---------------------------------------------------------------------------
 // mosh-go Predictor core
 // ---------------------------------------------------------------------------
@@ -103,7 +137,6 @@ fn overlay_underlines_when_flagging() {
     assert!(fb.cell_at(1, 0).unwrap().attr.under);
     assert_eq!(fb.cur_x, 2);
 }
-
 
 #[test]
 fn overlay_no_underline_when_not_flagging() {
@@ -168,7 +201,6 @@ fn divergence_resets_all() {
     assert_eq!(p.pending_known_char_at(1, 0), None);
     assert_eq!(p.cur_x(), 5, "kill_epoch snaps cursor to host");
 }
-
 
 #[test]
 fn space_confirms_as_match_not_stall() {
@@ -255,7 +287,6 @@ fn backspace_undoes_own_last_glyph() {
     assert_eq!(p.cur_x(), 0);
 }
 
-
 #[test]
 fn host_row_bs_uses_frame_pending_not_instant_diverge() {
     // Host has "hello"; BS at col 1 predicts shifted full remaining row.
@@ -271,7 +302,10 @@ fn host_row_bs_uses_frame_pending_not_instant_diverge() {
     p.keystroke(&[0x7f], &host);
     assert_eq!(p.cur_x(), 0);
     let n = p.pending_len();
-    assert_eq!(n, host.cols, "stock full-row BS: one cell per column, got {n}");
+    assert_eq!(
+        n, host.cols,
+        "stock full-row BS: one cell per column, got {n}"
+    );
     assert_eq!(p.pending_known_char_at(0, 0), Some('e'));
     // Host not yet updated — still Pending, no diverge
     p.confirm(&host);
@@ -330,10 +364,12 @@ fn left_cell_attr_inherited_on_overlay() {
     p.keystroke(b"x", &fb);
     p.overlay(&mut fb);
     assert_eq!(fb.cell_at(1, 0).unwrap().ch, 'x');
-    assert!(fb.cell_at(1, 0).unwrap().attr.bold, "inherit bold from left");
+    assert!(
+        fb.cell_at(1, 0).unwrap().attr.bold,
+        "inherit bold from left"
+    );
     assert!(fb.cell_at(1, 0).unwrap().attr.under, "flagging underlines");
 }
-
 
 #[test]
 fn send_interval_adaptive_thresholds() {
@@ -384,7 +420,6 @@ fn host_line_insert_shifts_tail_under_pending() {
     assert_eq!(p.pending_len(), host.cols - 2);
 }
 
-
 #[test]
 fn cr_advances_row_when_not_bottom() {
     let mut p = always();
@@ -395,7 +430,7 @@ fn cr_advances_row_when_not_bottom() {
 }
 
 #[test]
-fn original_ch_no_credit_for_noop() {
+fn original_contents_no_credit_for_noop() {
     let mut p = always();
     let mut host = blank_fb();
     host.put_rune(0, 0, 'a', Attr::default());
@@ -415,7 +450,6 @@ fn original_ch_no_credit_for_noop() {
         "noop match must not prove new band (ep was {ep})"
     );
 }
-
 
 #[test]
 fn pipeline_with_frames_confirm_after_ack() {
@@ -473,7 +507,6 @@ fn insert_mid_pending_shifts_trailing() {
     assert_eq!(fb.cell_at(4, 0).unwrap().ch, 'd');
 }
 
-
 #[test]
 fn host_bs_moves_glass_cursor() {
     let mut p = always_proven();
@@ -485,7 +518,6 @@ fn host_bs_moves_glass_cursor() {
     p.overlay(&mut fb);
     assert_eq!(fb.cur_x, 4);
 }
-
 
 #[test]
 fn space_pred_correct_no_credit_on_default_blank() {
@@ -499,7 +531,6 @@ fn space_pred_correct_no_credit_on_default_blank() {
     assert_eq!(p.confirmed_epoch_for_test(), 0, "blank must not prove band");
 }
 
-
 #[test]
 fn glitch_repairs_only_via_quick_credited_correct() {
     let mut p = adaptive_proven();
@@ -508,7 +539,7 @@ fn glitch_repairs_only_via_quick_credited_correct() {
     p.set_cursor(0, 0);
     p.keystroke(b"a", &blank_fb());
     p.backdate_all_for_test(Duration::from_millis(300));
-    p.expire_stale(Instant::now());
+    p.sample_pending_age(Instant::now());
     assert!(p.glitch_trigger_for_test() >= 10);
     // Fresh quick credited Correct repairs glitch by 1 (not full clear on empty).
     p.keystroke(b"b", &blank_fb());
@@ -529,9 +560,6 @@ fn glitch_repairs_only_via_quick_credited_correct() {
     );
 }
 
-
-
-
 #[test]
 fn bs_all_then_adaptive_demote() {
     let mut p = adaptive_proven();
@@ -550,7 +578,6 @@ fn bs_all_then_adaptive_demote() {
     assert!(!p.should_show());
     assert!(!p.active());
 }
-
 
 #[test]
 fn el_then_late_ack_confirms_against_final_grid() {
@@ -572,9 +599,6 @@ fn el_then_late_ack_confirms_against_final_grid() {
     );
 }
 
-
-
-
 #[test]
 fn frame_ack_pending_stalls_confirm_until_acked() {
     let mut p = always();
@@ -592,7 +616,6 @@ fn frame_ack_pending_stalls_confirm_until_acked() {
     assert_eq!(p.pending_len(), 0, "confirm after ack");
 }
 
-
 #[test]
 fn become_tentative_hides_new_preds_until_proven() {
     let mut p = always();
@@ -601,7 +624,11 @@ fn become_tentative_hides_new_preds_until_proven() {
     p.keystroke(b"a", &blank_fb());
     let mut hidden = blank_fb();
     p.overlay(&mut hidden);
-    assert_ne!(hidden.cell_at(0, 0).unwrap().ch, 'a', "unproven band hidden");
+    assert_ne!(
+        hidden.cell_at(0, 0).unwrap().ch,
+        'a',
+        "unproven band hidden"
+    );
     let mut fb = blank_fb();
     fb.put_rune(0, 0, 'a', Attr::default());
     fb.cur_x = 1;
@@ -624,8 +651,6 @@ fn become_tentative_hides_new_preds_until_proven() {
     );
 }
 
-
-
 // ---------------------------------------------------------------------------
 // Arrows / CSI
 // ---------------------------------------------------------------------------
@@ -644,7 +669,6 @@ fn csi_left_right_move_cursor_keep_pending() {
     assert_eq!(p.cur_x(), 2);
 }
 
-
 #[test]
 fn ss3_left_right_arrows() {
     let mut p = always();
@@ -657,7 +681,6 @@ fn ss3_left_right_arrows() {
     assert_eq!(p.cur_x(), 2);
     assert_eq!(p.pending_len(), before);
 }
-
 
 #[test]
 fn csi_param_right_arrow_moves_one_like_stock() {
@@ -673,7 +696,6 @@ fn csi_param_right_arrow_moves_one_like_stock() {
     assert!(p.active());
 }
 
-
 #[test]
 fn csi_param_left_arrow_moves_one_like_stock() {
     let mut p = always();
@@ -687,7 +709,6 @@ fn csi_param_left_arrow_moves_one_like_stock() {
     p.keystroke(b"\x1b[D", &blank_fb());
     assert_eq!(p.cur_x(), 0, "must clamp at col 0");
 }
-
 
 #[test]
 fn csi_zero_param_defaults_to_one() {
@@ -723,7 +744,6 @@ fn fragmented_csi_param_arrow_assembles() {
     assert_eq!(p.cur_x(), 2);
 }
 
-
 #[test]
 fn fragmented_csi_assembles_across_chunks() {
     let mut p = always();
@@ -745,7 +765,6 @@ fn fragmented_csi_assembles_across_chunks() {
     assert!(!p.has_esc_buf_for_test());
 }
 
-
 #[test]
 fn control_become_tentative_hides_new_not_wipe_old() {
     let mut p = always();
@@ -763,7 +782,6 @@ fn control_become_tentative_hides_new_not_wipe_old() {
     assert!(p.pending_len() >= before);
     assert_eq!(p.pending_known_char_at(0, 0), Some('a'));
 }
-
 
 // ---------------------------------------------------------------------------
 // Adaptive / flagging / glitch / expire
@@ -791,7 +809,6 @@ fn adaptive_hysteresis_show_and_flag() {
     assert!(!p.should_show());
 }
 
-
 #[test]
 fn cursor_only_active_latches_adaptive_show_like_stock() {
     // Stock active() is true for cursor-only Pending, so srtt_trigger holds.
@@ -808,20 +825,18 @@ fn cursor_only_active_latches_adaptive_show_like_stock() {
     );
 }
 
-
 #[test]
-fn expire_stale_after_timeout() {
+fn stock_keeps_unconfirmed_predictions_past_fifteen_seconds() {
     let mut p = always();
     p.set_cursor(0, 0);
     p.keystroke(b"a", &blank_fb());
+    let pending = p.pending_len();
     p.backdate_all_for_test(Duration::from_secs(16));
-    p.expire_stale(Instant::now());
-    assert_eq!(p.pending_len(), 0);
-    assert!(!p.active(), "expire must clear active when no cursor pred");
+    p.sample_pending_age(Instant::now());
+    assert_eq!(p.pending_len(), pending);
+    assert!(p.active(), "stock waits for the server's late ACK");
+    assert!(p.flagging(), "a long-pending prediction is underlined");
 }
-
-
-
 
 #[test]
 fn glitch_threshold_raises_trigger() {
@@ -829,7 +844,7 @@ fn glitch_threshold_raises_trigger() {
     p.set_cursor(0, 0);
     p.keystroke(b"a", &blank_fb());
     p.backdate_oldest_for_test(Duration::from_millis(300));
-    p.expire_stale(Instant::now());
+    p.sample_pending_age(Instant::now());
     assert!(
         p.glitch_trigger_for_test() >= 10,
         "age>=250ms must set glitch_trigger, got {}",
@@ -838,7 +853,6 @@ fn glitch_threshold_raises_trigger() {
     assert!(p.pending_len() >= 1);
 }
 
-
 #[test]
 fn last_column_places_known_and_wraps() {
     let mut p = always();
@@ -846,7 +860,11 @@ fn last_column_places_known_and_wraps() {
     p.set_cursor(3, 0);
     let ep_before = p.prediction_epoch_for_test();
     p.keystroke(b"x", &fb);
-    assert_eq!(p.pending_known_char_at(3, 0), Some('x'), "stock places known glyph");
+    assert_eq!(
+        p.pending_known_char_at(3, 0),
+        Some('x'),
+        "stock places known glyph"
+    );
     assert!(!p.pending_unknown_at(3, 0));
     assert_eq!(p.cur_x(), 0);
     assert_eq!(p.cur_y(), 1);
@@ -855,9 +873,12 @@ fn last_column_places_known_and_wraps() {
     let mut p2 = always();
     p2.set_cursor(0, 0);
     p2.keystroke("你".as_bytes(), &blank_fb());
-    assert_eq!(p2.pending_known_char_at(0, 0), None, "wide CJK must be tentative");
+    assert_eq!(
+        p2.pending_known_char_at(0, 0),
+        None,
+        "wide CJK must be tentative"
+    );
 }
-
 
 #[test]
 fn combining_mark_is_tentative() {
@@ -874,8 +895,6 @@ fn combining_mark_is_tentative() {
     );
 }
 
-
-
 // ---------------------------------------------------------------------------
 // DisplayPipeline — single paint path + no double paint
 // ---------------------------------------------------------------------------
@@ -887,6 +906,82 @@ fn never_mode_passthrough_host_bytes() {
     assert_eq!(out, b"\x1b[Hhello");
     assert!(pipe.on_keystroke(b"x").is_empty());
     assert!(!pipe.using_overlay_path());
+}
+
+#[test]
+fn notification_uses_the_single_framebuffer_paint_path_and_restores_host_row() {
+    let mut pipe = DisplayPipeline::new(40, 10, DisplayPreference::Never);
+    assert_eq!(
+        pipe.on_host_bytes(b"\x1b[Horiginal prompt"),
+        b"\x1b[Horiginal prompt"
+    );
+
+    let paint = pipe.set_notification(Some("mosh: Last contact 7 seconds ago.".to_string()));
+    assert!(!paint.is_empty());
+    assert!(pipe.using_overlay_path());
+    let shown = pipe.last_shown().expect("notification frame");
+    let message = "mosh: Last contact 7 seconds ago.";
+    for (x, expected) in message.chars().enumerate() {
+        let cell = shown.cell_at(x, 0).unwrap();
+        assert_eq!(cell.ch, expected);
+        assert!(cell.attr.bold);
+        assert_eq!(cell.attr.fg, crate::framebuffer::Color::index(7));
+        assert_eq!(cell.attr.bg, crate::framebuffer::Color::index(4));
+    }
+    assert!(
+        !shown.cursor_visible,
+        "top-row notification hides its cursor"
+    );
+
+    let _ = pipe.on_host_bytes(b"\x1b[Hchanged behind bar");
+    let shown = pipe.last_shown().unwrap();
+    assert_eq!(shown.cell_at(0, 0).unwrap().ch, 'm');
+
+    let clear = pipe.set_notification(None);
+    assert!(!clear.is_empty());
+    assert!(!pipe.using_overlay_path());
+    let shown = pipe.last_shown().unwrap();
+    let restored = (0..18)
+        .map(|x| shown.cell_at(x, 0).unwrap().ch)
+        .collect::<String>();
+    assert_eq!(restored, "changed behind bar");
+    assert!(shown.cursor_visible);
+}
+
+#[test]
+fn unchanged_notification_does_not_repaint() {
+    let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Adaptive);
+    let message = Some("mosh: Last reply 12 seconds ago.".to_string());
+    assert!(!pipe.set_notification(message.clone()).is_empty());
+    assert!(pipe.set_notification(message).is_empty());
+}
+
+#[test]
+fn adaptive_demote_clears_predictions_while_notification_stays_visible() {
+    let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Adaptive);
+    let _ = pipe.set_srtt(Some(Duration::from_millis(100)));
+    let _ = pipe.on_host_bytes(b"\x1b[2;1H$ ");
+    pipe.prove_band_for_test();
+    let _ = pipe.on_keystroke(b"x");
+    assert_eq!(pipe.last_shown().unwrap().cell_at(2, 1).unwrap().ch, 'x');
+    let _ = pipe.set_notification(Some("mosh: Last contact 7 seconds ago.".to_string()));
+
+    pipe.predictor_mut_for_test().reset();
+    let paint = pipe.set_srtt(Some(Duration::from_millis(5)));
+    assert!(!paint.is_empty());
+    assert_eq!(pipe.last_shown().unwrap().cell_at(2, 1).unwrap().ch, ' ');
+    assert_eq!(pipe.last_shown().unwrap().cell_at(0, 0).unwrap().ch, 'm');
+    assert!(pipe.using_overlay_path());
+}
+
+#[test]
+fn bulk_paste_does_not_clear_an_active_network_notification() {
+    let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Always);
+    let _ = pipe.set_notification(Some("mosh: Last contact 8 seconds ago.".to_string()));
+    let _ = pipe.on_keystroke(&vec![b'x'; 101]);
+    let shown = pipe.last_shown().unwrap();
+    assert_eq!(shown.cell_at(0, 0).unwrap().ch, 'm');
+    assert_eq!(shown.cell_at(1, 0).unwrap().ch, 'o');
 }
 
 #[test]
@@ -924,8 +1019,6 @@ fn pipeline_local_echo_then_confirm_no_double_glyph() {
     );
 }
 
-
-
 #[test]
 fn pipeline_relative_host_echo_no_double() {
     let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Always);
@@ -944,7 +1037,6 @@ fn pipeline_relative_host_echo_no_double() {
         "relative host echo must not leave a second l"
     );
 }
-
 
 #[test]
 fn pipeline_flagging_flip_repaints_underlines() {
@@ -967,7 +1059,6 @@ fn pipeline_flagging_flip_repaints_underlines() {
     );
 }
 
-
 #[test]
 fn pipeline_demote_show_clears_overlay() {
     let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Adaptive);
@@ -984,9 +1075,8 @@ fn pipeline_demote_show_clears_overlay() {
     assert!(!pipe.predictor().should_show());
 }
 
-
 #[test]
-fn pipeline_tick_expires_and_repaints_host_clean() {
+fn pipeline_tick_keeps_and_flags_long_pending_prediction() {
     let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Always);
     pipe.prove_band_for_test();
     let _ = pipe.on_host_bytes(b"\x1b[H");
@@ -997,20 +1087,58 @@ fn pipeline_tick_expires_and_repaints_host_clean() {
     pipe.predictor_mut_for_test()
         .backdate_all_for_test(Duration::from_secs(16));
     let paint = pipe.tick(Instant::now());
-    let _ = paint;
-    assert_eq!(pipe.predictor().pending_len(), 0);
+    assert!(!paint.is_empty(), "flagging transition repaints the row");
+    assert!(pipe.predictor().pending_len() > 0);
     let shown = pipe.last_shown().unwrap();
-    assert_ne!(
-        (
-            shown.cell_at(0, 0).unwrap().ch,
-            shown.cell_at(0, 0).unwrap().attr.under
-        ),
-        ('z', true),
-        "expired prediction must not remain underlined z on last_shown"
+    assert_eq!(shown.cell_at(0, 0).unwrap().ch, 'z');
+    assert!(
+        shown.cell_at(0, 0).unwrap().attr.under,
+        "stock underlines a prediction that remains unconfirmed"
     );
 }
 
+#[test]
+fn pipeline_tick_reveals_hidden_adaptive_prediction_after_stock_glitch_delay() {
+    let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Adaptive);
+    pipe.prove_band_for_test();
+    let _ = pipe.set_srtt(Some(Duration::from_millis(5)));
+    let _ = pipe.on_host_bytes(b"\x1b[H");
+    assert!(pipe.on_keystroke(b"z").is_empty());
+    assert!(!pipe.predictor().should_show());
 
+    pipe.predictor_mut_for_test()
+        .backdate_all_for_test(Duration::from_millis(300));
+    let paint = pipe.tick(Instant::now());
+
+    assert!(
+        !paint.is_empty(),
+        "the 250ms glitch transition must repaint"
+    );
+    assert!(pipe.predictor().should_show());
+    assert_eq!(pipe.last_shown().unwrap().cell_at(0, 0).unwrap().ch, 'z');
+}
+
+#[test]
+fn pipeline_tick_underlines_hidden_adaptive_prediction_after_five_seconds() {
+    let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Adaptive);
+    pipe.prove_band_for_test();
+    let _ = pipe.set_srtt(Some(Duration::from_millis(5)));
+    let _ = pipe.on_host_bytes(b"\x1b[H");
+    assert!(pipe.on_keystroke(b"z").is_empty());
+
+    pipe.predictor_mut_for_test()
+        .backdate_all_for_test(Duration::from_secs(6));
+    let paint = pipe.tick(Instant::now());
+
+    assert!(
+        !paint.is_empty(),
+        "the five-second flag transition must repaint"
+    );
+    assert!(pipe.predictor().flagging());
+    let shown = pipe.last_shown().unwrap();
+    assert_eq!(shown.cell_at(0, 0).unwrap().ch, 'z');
+    assert!(shown.cell_at(0, 0).unwrap().attr.under);
+}
 
 #[test]
 fn pipeline_bulk_paste_resets() {
@@ -1023,6 +1151,86 @@ fn pipeline_bulk_paste_resets() {
         0,
         "paste >100 must reset, not create 120 preds"
     );
+}
+
+#[test]
+fn stock_sgr_mouse_input_never_paints_coordinate_digits_as_predictions() {
+    let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Experimental);
+    let _ = pipe.on_host_bytes(b"$ ");
+
+    let first = pipe.on_keystroke(b"\x1b[<0;12");
+    let second = pipe.on_keystroke(b";5M");
+
+    assert!(
+        first.is_empty() && second.is_empty(),
+        "an SGR mouse report is one control input and must not locally echo its coordinates"
+    );
+}
+
+#[test]
+fn stock_mac_single_column_symbol_is_locally_predicted() {
+    let mut pipe = DisplayPipeline::new(8, 2, DisplayPreference::Experimental);
+
+    let paint = pipe.on_keystroke("☰".as_bytes());
+
+    assert!(
+        !paint.is_empty(),
+        "stock macOS wcwidth treats U+2630 as one cell"
+    );
+    let shown = pipe.last_shown().expect("predicted display frame");
+    assert_eq!(shown.cell_at(0, 0).unwrap().ch, '☰');
+    assert_eq!(shown.cell_at(0, 0).unwrap().width, 1);
+}
+
+#[test]
+fn stock_last_column_backspace_keeps_the_cursor_on_the_border() {
+    let mut pipe = DisplayPipeline::new(24, 8, DisplayPreference::Never);
+
+    // Stock Display prints a last-column replacement as a glyph followed by
+    // BS. Its terminal keeps an implicit cursor just beyond the right border,
+    // so BS cancels pending wrap and lands on the last visible column. The
+    // next replacement must overwrite that same cell, not the cell to its left.
+    pipe.on_host_bytes(b"\x1b[8;24Ha\x08");
+    pipe.on_host_bytes(b"P\x08");
+
+    assert_eq!(pipe.host_fb().cell_at(23, 7).unwrap().ch, 'P');
+    assert_eq!(pipe.host_fb().cell_at(22, 7).unwrap().ch, ' ');
+    assert_eq!((pipe.host_fb().cur_x, pipe.host_fb().cur_y), (23, 7));
+}
+
+#[test]
+fn stock_wide_overlap_preserves_the_uncovered_background_cell() {
+    let mut pipe = DisplayPipeline::new(24, 8, DisplayPreference::Never);
+
+    // Stock Display can first paint a wide glyph with a background at columns
+    // 2-3, then replace it with a new wide glyph starting at column 1. Xterm
+    // keeps the old trailing column as an erased cell with its old background.
+    pipe.on_host_bytes("\x1b[1;2H\x1b[48;2;0;0;0m🙂\x1b[m\x1b[1;1H".as_bytes());
+    pipe.on_host_bytes("🙂".as_bytes());
+
+    assert_eq!(pipe.host_fb().cell_at(0, 0).unwrap().ch, '🙂');
+    assert_eq!(pipe.host_fb().cell_at(0, 0).unwrap().width, 2);
+    assert_eq!(pipe.host_fb().cell_at(1, 0).unwrap().width, 0);
+    let uncovered = pipe.host_fb().cell_at(2, 0).unwrap();
+    assert_eq!(uncovered.ch, ' ');
+    assert_eq!(uncovered.width, 1);
+    assert_eq!(uncovered.attr.bg, Color::rgb(0, 0, 0));
+}
+
+#[test]
+fn stock_display_can_paint_a_wide_server_cell_in_the_last_column() {
+    let mut pipe = DisplayPipeline::new(24, 8, DisplayPreference::Never);
+
+    // When the remote terminal has DECAWM disabled, stock Display represents
+    // a wide cell at the right border with this exact sequence. HostBytes are
+    // already a display diff, so the client must not reinterpret the glyph as
+    // raw application output and move it to the next row.
+    pipe.on_host_bytes("\x1b[1;24H💻\r\n\x1b[1;24H".as_bytes());
+
+    assert_eq!(pipe.host_fb().cell_at(23, 0).unwrap().ch, '💻');
+    assert_eq!(pipe.host_fb().cell_at(23, 0).unwrap().width, 2);
+    assert_eq!(pipe.host_fb().cell_at(0, 1).unwrap().ch, ' ');
+    assert_eq!((pipe.host_fb().cur_x, pipe.host_fb().cur_y), (23, 0));
 }
 
 #[test]
@@ -1042,7 +1250,6 @@ fn pipeline_bs_then_confirm_stable() {
     pipe.predictor_mut_for_test().confirm(&fb);
     assert_eq!(pipe.predictor().pending_known_char_at(0, 0), None);
 }
-
 
 #[test]
 fn pipeline_resize_full_redraw() {
@@ -1107,14 +1314,16 @@ fn unknown_overlay_does_not_replace_glyph() {
     let mut fb = blank_fb();
     fb.put_rune(0, 0, 'H', Attr::default());
     p.overlay(&mut fb);
-    assert_eq!(fb.cell_at(0, 0).unwrap().ch, 'H', "unknown must not replace host");
+    assert_eq!(
+        fb.cell_at(0, 0).unwrap().ch,
+        'H',
+        "unknown must not replace host"
+    );
     assert!(
         fb.cell_at(0, 0).unwrap().attr.under,
         "flagging still underlines unknown mid-row"
     );
 }
-
-
 
 #[test]
 fn overwrite_bs_clears_cell_not_shift() {
@@ -1150,7 +1359,6 @@ fn adaptive_cold_builds_background_predictions() {
     assert_eq!(fb.cell_at(0, 0).unwrap().ch, 'h');
 }
 
-
 #[test]
 fn pipeline_adaptive_background_then_show() {
     let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Adaptive);
@@ -1167,7 +1375,6 @@ fn pipeline_adaptive_background_then_show() {
     );
     assert!(pipe.predictor().should_show());
 }
-
 
 #[test]
 fn pipeline_ich_confirms_final_grid_not_hard_reset() {
@@ -1187,8 +1394,6 @@ fn pipeline_ich_confirms_final_grid_not_hard_reset() {
         "ICH mismatch resolves via Confirm"
     );
 }
-
-
 
 #[test]
 fn pipeline_split_host_csi_reassembled() {
@@ -1263,7 +1468,6 @@ fn ss3_up_does_not_pollute_pending() {
     assert!(p.prediction_epoch_for_test() > ep);
 }
 
-
 #[test]
 fn pipeline_split_ich_still_parsed_for_host() {
     // Split CSI ICH must reassemble via carry for host_fb (not prediction wipe).
@@ -1273,11 +1477,10 @@ fn pipeline_split_ich_still_parsed_for_host() {
     assert_eq!(pipe.host_fb().cell_at(0, 0).unwrap().ch, 'x');
     let _ = pipe.on_host_bytes(b"\x1b[1;1H\x1b[2"); // incomplete ICH
     let _ = pipe.on_host_bytes(b"@"); // complete
-    // Host should have inserted blanks at (0,0)
-    // After ICH 2 at 1;1, x,y shift right
+                                      // Host should have inserted blanks at (0,0)
+                                      // After ICH 2 at 1;1, x,y shift right
     assert_eq!(pipe.host_fb().cell_at(2, 0).unwrap().ch, 'x');
 }
-
 
 #[test]
 fn adaptive_demote_holds_while_cursor_pending() {
@@ -1287,9 +1490,11 @@ fn adaptive_demote_holds_while_cursor_pending() {
     p.keystroke(b"\x1b[D", &blank_fb());
     assert!(p.active());
     p.set_srtt(Some(Duration::from_millis(5)));
-    assert!(p.should_show(), "cursor-only Pending holds show (stock active)");
+    assert!(
+        p.should_show(),
+        "cursor-only Pending holds show (stock active)"
+    );
 }
-
 
 #[test]
 fn kill_epoch_resyncs_cursor_to_host_strict() {
@@ -1333,8 +1538,6 @@ fn correct_cascades_host_renditions_to_rest_of_row() {
     assert!(fb.cell_at(1, 0).unwrap().attr.under);
 }
 
-
-
 #[test]
 fn correct_no_credit_does_not_prove_or_false_cascade_path() {
     let mut p = always();
@@ -1356,7 +1559,6 @@ fn correct_no_credit_does_not_prove_or_false_cascade_path() {
         "CorrectNoCredit must not advance confirmed_epoch"
     );
 }
-
 
 #[test]
 fn correct_cascade_same_row_only() {
@@ -1405,9 +1607,11 @@ fn correct_cascade_dim_and_fg() {
     fb.put_rune(0, 0, 'x', attr);
     p.overlay(&mut fb);
     assert!(fb.cell_at(1, 0).unwrap().attr.dim);
-    assert_eq!(fb.cell_at(1, 0).unwrap().attr.fg, crate::framebuffer::Color::index(2));
+    assert_eq!(
+        fb.cell_at(1, 0).unwrap().attr.fg,
+        crate::framebuffer::Color::index(2)
+    );
 }
-
 
 #[test]
 fn correct_cascade_survives_flagging_off() {
@@ -1448,7 +1652,6 @@ fn keystroke_split_utf8_euro_reassembled() {
     assert_eq!(p.pending_known_char_at(0, 0), Some('€'));
 }
 
-
 #[test]
 fn keystroke_split_utf8_after_ascii_prefix() {
     let mut p = always();
@@ -1460,7 +1663,6 @@ fn keystroke_split_utf8_after_ascii_prefix() {
     p.keystroke(&[0xa9], &blank_fb());
     assert_eq!(p.pending_known_char_at(1, 0), Some('é'));
 }
-
 
 #[test]
 fn keystroke_invalid_utf8_lead_is_tentative() {
@@ -1478,7 +1680,6 @@ fn keystroke_invalid_utf8_lead_is_tentative() {
     );
 }
 
-
 #[test]
 fn keystroke_utf8_carry_does_not_break_following_csi() {
     let mut p = always();
@@ -1490,7 +1691,6 @@ fn keystroke_utf8_carry_does_not_break_following_csi() {
     assert_eq!(p.cur_x(), 0);
     assert_eq!(p.pending_known_char_at(0, 0), Some('a'));
 }
-
 
 #[test]
 fn pipeline_keystroke_split_utf8_paints_once_complete() {
@@ -1505,7 +1705,6 @@ fn pipeline_keystroke_split_utf8_paints_once_complete() {
     assert_eq!(pipe.predictor().pending_known_char_at(0, 0), Some('é'));
 }
 
-
 #[test]
 fn pipeline_csi_param_arrow_moves_glass_cursor() {
     let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Always);
@@ -1515,7 +1714,6 @@ fn pipeline_csi_param_arrow_moves_glass_cursor() {
     // Stock: +1 only
     assert_eq!(pipe.predictor().cur_x(), 1);
 }
-
 
 #[test]
 fn pipeline_correct_cascade_visible_in_last_shown() {
@@ -1537,7 +1735,6 @@ fn pipeline_correct_cascade_visible_in_last_shown() {
         "cascade bold onto remaining pred in last_shown"
     );
 }
-
 
 // ---------------------------------------------------------------------------
 // late_ack (echo_ack) vs early transport ack
@@ -1566,7 +1763,6 @@ fn pending_uses_late_ack_not_early_transport_ack() {
     p.confirm(&host);
     assert_eq!(p.pending_len(), 0, "late_ack must release Pending");
 }
-
 
 #[test]
 fn cursor_only_pending_waits_for_late_ack() {
@@ -1621,8 +1817,6 @@ fn stock_fresh_session_hides_until_credited_correct() {
     assert_eq!(view.cell_at(1, 0).unwrap().ch, 'y');
     assert!(view.cell_at(1, 0).unwrap().attr.under);
 }
-
-
 
 #[test]
 fn stock_reset_does_not_realign_confirmed_epoch() {
@@ -1721,15 +1915,15 @@ fn stock_unknown_last_col_no_underline() {
     );
 }
 
-
-
-
 #[test]
 fn stock_host_row_bs_last_two_cols_unknown() {
     // Stock uses i+2 < width → penultimate AND last are unknown (dual-unknown tail).
     let mut p = always();
     let mut host = Framebuffer::new(8, 2);
-    for (i, ch) in ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'].into_iter().enumerate() {
+    for (i, ch) in ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']
+        .into_iter()
+        .enumerate()
+    {
         host.put_rune(i, 0, ch, Attr::default());
     }
     p.set_cursor(2, 0);
@@ -1745,7 +1939,6 @@ fn stock_host_row_bs_last_two_cols_unknown() {
     assert!(p.pending_unknown_at(7, 0), "stock last unknown");
     assert_ne!(p.pending_known_char_at(6, 0), Some('h'));
 }
-
 
 #[test]
 fn stock_full_row_insert_shifts_through_last_column() {
@@ -1764,7 +1957,6 @@ fn stock_full_row_insert_shifts_through_last_column() {
     assert!(p.pending_unknown_at(7, 0));
 }
 
-
 #[test]
 fn stock_glitch_trigger_truthy_forces_show() {
     let mut p = adaptive();
@@ -1774,7 +1966,7 @@ fn stock_glitch_trigger_truthy_forces_show() {
     p.set_cursor(0, 0);
     p.keystroke(b"a", &blank_fb());
     p.backdate_all_for_test(Duration::from_millis(300));
-    p.expire_stale(Instant::now());
+    p.sample_pending_age(Instant::now());
     assert!(p.glitch_trigger_for_test() >= 10);
     // Low SRTT but glitch truthy → show
     p.set_srtt(Some(Duration::from_millis(5)));
@@ -1789,10 +1981,7 @@ fn stock_pipeline_never_dual_writes_raw_glyphs() {
     let paint = pipe.on_keystroke(b"z");
     // Paint must be Diff CSI/CUP style, not bare dual-write of only 'z' without model
     assert!(!paint.is_empty());
-    assert!(
-        pipe.using_overlay_path(),
-        "Always uses overlay Diff path"
-    );
+    assert!(pipe.using_overlay_path(), "Always uses overlay Diff path");
     let shown = pipe.last_shown().unwrap();
     assert_eq!(shown.cell_at(1, 0).unwrap().ch, 'z');
     // Host model itself must NOT have the prediction (host_fb is server-only)
@@ -1823,7 +2012,11 @@ fn stock_blank_pred_always_correct_no_credit_even_if_host_differs() {
     p.set_frames(4, 4, 4);
     p.confirm(&host);
     assert_eq!(p.pending_known_char_at(0, 0), None);
-    assert_eq!(p.confirmed_epoch_for_test(), conf, "blank never proves band");
+    assert_eq!(
+        p.confirmed_epoch_for_test(),
+        conf,
+        "blank never proves band"
+    );
 }
 
 #[test]
@@ -1858,9 +2051,9 @@ fn stock_glitch_repair_only_on_credited_correct() {
     p.set_cursor(0, 0);
     p.keystroke(b" ", &blank_fb()); // blank pred
     p.backdate_all_for_test(Duration::from_millis(50)); // quick but no-credit
-    // Force glitch high
+                                                        // Force glitch high
     p.backdate_all_for_test(Duration::from_millis(300));
-    p.expire_stale(Instant::now());
+    p.sample_pending_age(Instant::now());
     let g = p.glitch_trigger_for_test();
     assert!(g >= 10);
     // Confirm blank match (CorrectNoCredit) — must NOT repair glitch
@@ -1965,7 +2158,7 @@ fn stock_reset_preserves_glitch_trigger() {
     p.set_cursor(0, 0);
     p.keystroke(b"a", &blank_fb());
     p.backdate_all_for_test(Duration::from_millis(300));
-    p.expire_stale(Instant::now());
+    p.sample_pending_age(Instant::now());
     let g = p.glitch_trigger_for_test();
     assert!(g >= 10);
     p.reset();
@@ -1997,14 +2190,18 @@ fn stock_kill_epoch_removes_failed_and_newer_bands() {
     p.keystroke(b"xy", &blank_fb()); // epoch e_fail
     p.become_tentative();
     p.keystroke(b"z", &blank_fb()); // newer epoch
-    // Diverge on first of failed band
+                                    // Diverge on first of failed band
     let mut bad = blank_fb();
     bad.put_rune(2, 0, 'Q', Attr::default());
     bad.cur_x = 3;
     p.confirm(&bad);
     assert_eq!(p.pending_known_char_at(2, 0), None);
     assert_eq!(p.pending_known_char_at(3, 0), None);
-    assert_eq!(p.pending_known_char_at(4, 0), None, "newer band also killed");
+    assert_eq!(
+        p.pending_known_char_at(4, 0),
+        None,
+        "newer band also killed"
+    );
     assert_eq!(p.cur_x(), 3, "cursor snapped to host");
     let _ = e_fail;
 }
@@ -2045,9 +2242,8 @@ fn pipeline_late_ack_without_host_bytes_drains_pending() {
     let _ = paint;
 }
 
-
 #[test]
-fn kill_epoch_does_not_stick_synthetic_cursor_pending() {
+fn kill_epoch_anchors_host_cursor_until_normal_confirmation() {
     let mut p = always();
     p.set_overwrite_for_test(true);
     p.set_cursor(0, 0);
@@ -2056,7 +2252,12 @@ fn kill_epoch_does_not_stick_synthetic_cursor_pending() {
     fb.put_rune(0, 0, 'x', Attr::default());
     fb.cur_x = 5;
     p.confirm(&fb); // tentative diverge → kill_epoch
-    assert!(!p.active(), "no sticky active after empty kill");
+    assert!(p.active(), "stock keeps the host cursor conditional");
+    let mut painted = fb.clone();
+    p.overlay(&mut painted);
+    assert_eq!((painted.cur_x, painted.cur_y), (5, fb.cur_y));
+    p.confirm(&fb);
+    assert!(!p.active(), "matching host cursor drains normally");
     // set_cursor must work again
     p.set_cursor(2, 3);
     assert_eq!(p.cur_x(), 2);
@@ -2080,6 +2281,26 @@ fn overwrite_retype_same_cell_replaces_not_stacks() {
         }
     }
     assert_eq!(count, 1, "must not stack overwrite preds at same cell");
+}
+
+#[test]
+fn repeated_overwrite_value_does_not_falsely_confirm_a_tentative_epoch() {
+    let mut p = always();
+    p.set_overwrite_for_test(true);
+    let mut host = blank_fb();
+    p.set_cursor(0, 0);
+    p.keystroke(b"b", &host);
+    p.keystroke(b"\x1b[D", &host);
+    p.keystroke(b"b", &host);
+
+    host.put_rune(0, 0, 'b', Attr::default());
+    p.confirm(&host);
+
+    assert_eq!(
+        p.confirmed_epoch_for_test(),
+        0,
+        "a value already predicted at this cell is CorrectNoCredit in stock mosh"
+    );
 }
 
 #[test]
@@ -2133,6 +2354,24 @@ fn overlay_does_not_move_cursor_for_tentative_cr() {
 }
 
 #[test]
+fn tentative_new_cursor_keeps_the_last_confirmed_cursor_visible() {
+    let mut p = always_proven();
+    p.set_overwrite_for_test(true);
+    let host = blank_fb();
+    p.set_cursor(0, 0);
+    p.keystroke(b"ab", &host);
+    p.keystroke(b"\r", &host);
+
+    let mut view = blank_fb();
+    p.overlay(&mut view);
+    assert_eq!(
+        (view.cur_x, view.cur_y),
+        (2, 0),
+        "stock applies the older confirmed cursor and hides the newer tentative CR"
+    );
+}
+
+#[test]
 fn host_wrap_scroll_resets_pending() {
     let mut pipe = DisplayPipeline::new(4, 3, DisplayPreference::Always);
     pipe.prove_band_for_test();
@@ -2157,6 +2396,28 @@ fn host_wrap_scroll_resets_pending() {
     );
 }
 
+#[test]
+fn reconstructed_host_frame_scroll_resets_pending() {
+    let mut pipe = DisplayPipeline::new(4, 3, DisplayPreference::Always);
+    pipe.prove_band_for_test();
+    let mut host = Framebuffer::new(4, 3);
+    host.cur_x = 0;
+    host.cur_y = 2;
+    let _ = pipe.on_host_frame(&host);
+    pipe.predictor_mut_for_test().set_overwrite_for_test(true);
+    let _ = pipe.on_keystroke(b"z");
+    assert!(pipe.predictor().pending_len() > 0);
+
+    let mut scrolled = host.clone();
+    crate::ansi_apply::apply_ansi(&mut scrolled, b"\n");
+    assert_ne!(scrolled.scroll_generation, host.scroll_generation);
+    let _ = pipe.on_host_frame(&scrolled);
+    assert_eq!(
+        pipe.predictor().pending_len(),
+        0,
+        "a reconstructed server scroll must invalidate old prediction rows"
+    );
+}
 
 #[test]
 fn last_col_insert_collates_prior_unknown() {
@@ -2166,7 +2427,7 @@ fn last_col_insert_collates_prior_unknown() {
     // densify via insert
     p.keystroke(b"abc", &fb); // fills 0..2, last col unknown from shifts
     p.keystroke(b"d", &fb); // last col place known
-    // only one pred at (3,0)
+                            // only one pred at (3,0)
     let mut n = 0;
     for i in 0..p.pending_len() {
         if p.pending_pos(i) == Some((3, 0)) {
@@ -2271,6 +2532,10 @@ fn confirm_skips_pending_continues_later_cells() {
     host.cur_x = 2;
     p.confirm(&host);
     // b must be drained; X still pending (or pending if late < 6)
-    assert_eq!(p.pending_known_char_at(1, 0), None, "later Correct must not stall behind Pending");
+    assert_eq!(
+        p.pending_known_char_at(1, 0),
+        None,
+        "later Correct must not stall behind Pending"
+    );
     assert_eq!(p.pending_known_char_at(0, 0), Some('X'));
 }

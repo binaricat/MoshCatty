@@ -4,7 +4,7 @@
 //! last_shown cells, paint bytes, flagging, demote, and double-paint safety.
 
 use super::*;
-use crate::framebuffer::Attr;
+use crate::framebuffer::{Attr, Color};
 use std::time::{Duration, Instant};
 
 fn blank_fb() -> Framebuffer {
@@ -1151,6 +1151,57 @@ fn pipeline_bulk_paste_resets() {
         0,
         "paste >100 must reset, not create 120 preds"
     );
+}
+
+#[test]
+fn stock_last_column_backspace_keeps_the_cursor_on_the_border() {
+    let mut pipe = DisplayPipeline::new(24, 8, DisplayPreference::Never);
+
+    // Stock Display prints a last-column replacement as a glyph followed by
+    // BS. Its terminal keeps an implicit cursor just beyond the right border,
+    // so BS cancels pending wrap and lands on the last visible column. The
+    // next replacement must overwrite that same cell, not the cell to its left.
+    pipe.on_host_bytes(b"\x1b[8;24Ha\x08");
+    pipe.on_host_bytes(b"P\x08");
+
+    assert_eq!(pipe.host_fb().cell_at(23, 7).unwrap().ch, 'P');
+    assert_eq!(pipe.host_fb().cell_at(22, 7).unwrap().ch, ' ');
+    assert_eq!((pipe.host_fb().cur_x, pipe.host_fb().cur_y), (23, 7));
+}
+
+#[test]
+fn stock_wide_overlap_preserves_the_uncovered_background_cell() {
+    let mut pipe = DisplayPipeline::new(24, 8, DisplayPreference::Never);
+
+    // Stock Display can first paint a wide glyph with a background at columns
+    // 2-3, then replace it with a new wide glyph starting at column 1. Xterm
+    // keeps the old trailing column as an erased cell with its old background.
+    pipe.on_host_bytes("\x1b[1;2H\x1b[48;2;0;0;0m🙂\x1b[m\x1b[1;1H".as_bytes());
+    pipe.on_host_bytes("🙂".as_bytes());
+
+    assert_eq!(pipe.host_fb().cell_at(0, 0).unwrap().ch, '🙂');
+    assert_eq!(pipe.host_fb().cell_at(0, 0).unwrap().width, 2);
+    assert_eq!(pipe.host_fb().cell_at(1, 0).unwrap().width, 0);
+    let uncovered = pipe.host_fb().cell_at(2, 0).unwrap();
+    assert_eq!(uncovered.ch, ' ');
+    assert_eq!(uncovered.width, 1);
+    assert_eq!(uncovered.attr.bg, Color::rgb(0, 0, 0));
+}
+
+#[test]
+fn stock_display_can_paint_a_wide_server_cell_in_the_last_column() {
+    let mut pipe = DisplayPipeline::new(24, 8, DisplayPreference::Never);
+
+    // When the remote terminal has DECAWM disabled, stock Display represents
+    // a wide cell at the right border with this exact sequence. HostBytes are
+    // already a display diff, so the client must not reinterpret the glyph as
+    // raw application output and move it to the next row.
+    pipe.on_host_bytes("\x1b[1;24H💻\r\n\x1b[1;24H".as_bytes());
+
+    assert_eq!(pipe.host_fb().cell_at(23, 0).unwrap().ch, '💻');
+    assert_eq!(pipe.host_fb().cell_at(23, 0).unwrap().width, 2);
+    assert_eq!(pipe.host_fb().cell_at(0, 1).unwrap().ch, ' ');
+    assert_eq!((pipe.host_fb().cur_x, pipe.host_fb().cur_y), (23, 0));
 }
 
 #[test]

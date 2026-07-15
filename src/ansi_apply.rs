@@ -3,8 +3,7 @@
 //! Tracks the VT/ECMA-48 state emitted by official Mosh, including cursor and
 //! scrolling modes, tab stops, colors, OSC metadata, and split sequences.
 
-use crate::framebuffer::{Attr, Cell, Color, ColorType, Framebuffer};
-use unicode_width::UnicodeWidthChar;
+use crate::framebuffer::{display_cell_width, Attr, Cell, Color, ColorType, Framebuffer};
 
 #[derive(Debug, Clone)]
 struct SavedCursor {
@@ -81,7 +80,11 @@ pub fn apply_ansi_with_pen(fb: &mut Framebuffer, pen: &mut AnsiPen, data: &[u8])
         }
         if b == 0x08 {
             // BS
-            if fb.cur_x > 0 {
+            // Stock keeps the draw cursor one column beyond the right border
+            // while autowrap is pending, even though the visible framebuffer
+            // reports the last column. A BS first lands that implicit cursor
+            // on the border; only an ordinary BS moves one visible cell left.
+            if !fb.next_print_will_wrap && fb.cur_x > 0 {
                 fb.cur_x -= 1;
             }
             fb.next_print_will_wrap = false;
@@ -120,7 +123,7 @@ pub fn apply_ansi_with_pen(fb: &mut Framebuffer, pen: &mut AnsiPen, data: &[u8])
                 if fb.try_extend_active_grapheme(ch) {
                     continue;
                 }
-                let glyph_width = UnicodeWidthChar::width(ch).unwrap_or(0).min(2);
+                let glyph_width = display_cell_width(ch).unwrap_or(0);
                 // Stock next_print_will_wrap: wrap *before* placing the next glyph.
                 if fb.auto_wrap_mode && fb.next_print_will_wrap {
                     fb.next_print_will_wrap = false;
@@ -132,9 +135,16 @@ pub fn apply_ansi_with_pen(fb: &mut Framebuffer, pen: &mut AnsiPen, data: &[u8])
                         fb.cur_y = (fb.cur_y + 1).min(fb.rows.saturating_sub(1));
                     }
                     fb.cur_x = 0;
-                } else if fb.auto_wrap_mode && glyph_width == 2 && fb.cur_x + 1 >= fb.cols {
-                    // A double-width glyph cannot start in the last column.
-                    // Stock clears that cell and wraps the glyph as a unit.
+                } else if fb.auto_wrap_mode
+                    && xterm_standalone_width(ch) == 2
+                    && fb.cur_x + 1 >= fb.cols
+                {
+                    // HostBytes are interpreted by xterm.js, whose Unicode
+                    // grapheme provider treats supplementary-plane standalone
+                    // emoji as one column but BMP East Asian wide characters
+                    // as two. Only the latter wraps before painting at the
+                    // right border. The server-side framebuffer width remains
+                    // `glyph_width`, which is intentionally a separate value.
                     let x = fb.cur_x;
                     let y = fb.cur_y;
                     if let Some(cell) = fb.cell_at_mut(x, y) {
@@ -172,6 +182,15 @@ pub fn apply_ansi_with_pen(fb: &mut Framebuffer, pen: &mut AnsiPen, data: &[u8])
             }
         }
     }
+}
+
+/// Width of a standalone codepoint in Netcatty's xterm.js Unicode 15
+/// grapheme provider. Unlike `unicode-width`/server libc, supplementary-plane
+/// emoji and CJK extensions are narrow until a grapheme sequence widens them.
+fn xterm_standalone_width(ch: char) -> usize {
+    display_cell_width(ch)
+        .unwrap_or(0)
+        .min(if (ch as u32) > 0xffff { 1 } else { 2 })
 }
 
 fn scroll_up_region(fb: &mut Framebuffer, top: usize, bottom: usize, lines: usize, blank: &Cell) {
@@ -931,15 +950,65 @@ mod tests {
     }
 
     #[test]
-    fn wide_glyph_at_last_column_wraps_before_painting() {
+    fn display_server_wide_xterm_narrow_emoji_can_paint_the_last_column() {
         let mut fb = Framebuffer::new(4, 2);
-        apply_ansi(&mut fb, "abc界".as_bytes());
+        apply_ansi(&mut fb, "abc💻".as_bytes());
 
-        assert_eq!(fb.cell_at(3, 0).unwrap().ch, ' ');
-        assert_eq!(fb.cell_at(0, 1).unwrap().ch, '界');
-        assert_eq!(fb.cell_at(0, 1).unwrap().width, 2);
-        assert_eq!(fb.cell_at(1, 1).unwrap().width, 0);
-        assert_eq!((fb.cur_x, fb.cur_y), (2, 1));
+        assert_eq!(fb.cell_at(3, 0).unwrap().ch, '💻');
+        assert_eq!(fb.cell_at(3, 0).unwrap().width, 2);
+        assert_eq!(fb.cell_at(0, 1).unwrap().ch, ' ');
+        assert_eq!((fb.cur_x, fb.cur_y), (3, 0));
+        assert!(fb.next_print_will_wrap);
+    }
+
+    #[test]
+    fn xterm_standalone_width_boundary_matches_netcatty_unicode_provider() {
+        for (ch, expected) in [
+            ('\u{ffff}', 1),
+            ('\u{10000}', 1),
+            ('\u{20000}', 1),
+            ('💻', 1),
+            ('界', 2),
+        ] {
+            assert_eq!(xterm_standalone_width(ch), expected, "U+{:04X}", ch as u32);
+        }
+    }
+
+    #[test]
+    fn xterm_standalone_width_covers_all_unicode_15_overrides() {
+        let narrow_ranges = [
+            0x17a4..=0x17a4,
+            0x17d8..=0x17d8,
+            0x2630..=0x2637,
+            0x268a..=0x268f,
+            0x2ffc..=0x2fff,
+            0x31e4..=0x31e5,
+            0x31ef..=0x31ef,
+            0x4dc0..=0x4dff,
+        ];
+        for cp in narrow_ranges.into_iter().flatten() {
+            let ch = char::from_u32(cp).unwrap();
+            assert_eq!(xterm_standalone_width(ch), 1, "U+{cp:04X}");
+        }
+
+        assert_eq!(xterm_standalone_width('\u{3164}'), 2);
+    }
+
+    #[test]
+    fn unicode_15_width_overrides_are_painted_in_the_expected_cells() {
+        let mut narrow = Framebuffer::new(4, 2);
+        apply_ansi(&mut narrow, "abc☰".as_bytes());
+        assert_eq!(narrow.cell_at(3, 0).unwrap().ch, '☰');
+        assert_eq!(narrow.cell_at(3, 0).unwrap().width, 1);
+        assert_eq!(narrow.cell_at(0, 1).unwrap().ch, ' ');
+
+        let mut wide = Framebuffer::new(4, 2);
+        apply_ansi(&mut wide, "aㅤb".as_bytes());
+        assert_eq!(wide.cell_at(0, 0).unwrap().ch, 'a');
+        assert_eq!(wide.cell_at(1, 0).unwrap().ch, 'ㅤ');
+        assert_eq!(wide.cell_at(1, 0).unwrap().width, 2);
+        assert_eq!(wide.cell_at(2, 0).unwrap().width, 0);
+        assert_eq!(wide.cell_at(3, 0).unwrap().ch, 'b');
     }
 
     #[test]

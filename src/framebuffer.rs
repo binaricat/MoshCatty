@@ -13,6 +13,31 @@ const MAX_GRAPHEME_BYTES: usize = 32;
 const ALLOCATION_OVERHEAD: usize = 16;
 const ARC_OVERHEAD: usize = 2 * std::mem::size_of::<usize>() + ALLOCATION_OVERHEAD;
 
+/// Cell width used while rebuilding stock Display output. The pinned xterm.js
+/// Unicode 15 provider differs from `unicode-width` 17 for these BMP codepoints.
+/// Supplementary-plane widths stay server-shaped here and are narrowed only
+/// for xterm's right-margin decision in `ansi_apply`.
+pub(crate) fn display_cell_width(ch: char) -> Option<usize> {
+    let cp = ch as u32;
+    if cp == 0x3164 {
+        return Some(2);
+    }
+    if matches!(
+        cp,
+        0x17a4
+            | 0x17d8
+            | 0x2630..=0x2637
+            | 0x268a..=0x268f
+            | 0x2ffc..=0x2fff
+            | 0x31e4..=0x31e5
+            | 0x31ef
+            | 0x4dc0..=0x4dff
+    ) {
+        return Some(1);
+    }
+    UnicodeWidthChar::width(ch).map(|width| width.min(2))
+}
+
 /// OSC 8 hyperlink attached to terminal cells.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hyperlink {
@@ -527,10 +552,9 @@ impl Framebuffer {
         attr: Attr,
         hyperlink: u32,
     ) -> usize {
-        let Some(w) = UnicodeWidthChar::width(ch) else {
+        let Some(w) = display_cell_width(ch) else {
             return 0;
         };
-        let w = w.min(2);
         if w == 0 {
             return 0;
         }
@@ -549,15 +573,15 @@ impl Framebuffer {
             }
         }
         // A new wide glyph can also cover the owner column of a different
-        // wide glyph immediately to its right. Xterm clears that old glyph's
-        // trailing continuation using the active background.
+        // wide glyph immediately to its right. Xterm uncovers that old
+        // glyph's trailing continuation as a blank with the old background.
         let overlaps_wide_owner_on_right = w == 2
             && x + 2 < self.cols
             && self.cell_at(x + 1, y).is_some_and(|cell| cell.width == 2)
             && self.cell_at(x + 2, y).is_some_and(|cell| cell.width == 0);
         if overlaps_wide_owner_on_right {
             if let Some(trailing) = self.cell_at_mut(x + 2, y) {
-                *trailing = Cell::erased(attr.bg);
+                *trailing = Cell::erased(trailing.attr.bg);
             }
         }
         let old_width = self.cell_at(x, y).map(|cell| cell.width).unwrap_or(1);
@@ -587,7 +611,7 @@ impl Framebuffer {
     /// Append one zero-width codepoint to the combining cell selected by the
     /// server terminal model. Width is fixed by the first printable codepoint.
     pub(crate) fn try_extend_active_grapheme(&mut self, ch: char) -> bool {
-        match UnicodeWidthChar::width(ch) {
+        match display_cell_width(ch) {
             Some(0) => {}
             Some(_) => return false,
             None => return true,
@@ -1479,7 +1503,7 @@ mod tests {
         assert_eq!(fb.cell_at(1, 0).unwrap().width, 0);
         assert_eq!(fb.cell_at(2, 0).unwrap().ch, ' ');
         assert_eq!(fb.cell_at(2, 0).unwrap().width, 1);
-        assert_eq!(fb.cell_at(2, 0).unwrap().attr.bg, Color::index(4));
+        assert_eq!(fb.cell_at(2, 0).unwrap().attr.bg, Color::index(1));
     }
 
     #[test]

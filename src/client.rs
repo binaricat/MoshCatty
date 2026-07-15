@@ -974,6 +974,84 @@ mod tests {
     }
 
     #[test]
+    fn client_reassembles_a_thousand_fragment_official_state_across_receive_turns() {
+        let key = [67u8; 16];
+        let key_b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .encode(key)
+                .trim_end_matches('=')
+                .to_string()
+        };
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let mut server = Transport::new_server(Ocb::new(&key).unwrap());
+        let mut client = Client::dial_with_size("127.0.0.1", port, &key_b64, 1000, 70).unwrap();
+        let mut wire = [0u8; 4096];
+
+        let (n, client_addr) = socket.recv_from(&mut wire).expect("initial client state");
+        server
+            .recv_state(&wire[..n])
+            .expect("initial client state decodes");
+
+        let mut hoststring = Vec::with_capacity(2_200_000);
+        for i in 0..68_000u64 {
+            hoststring.push(b'X');
+            let mut state = i.wrapping_add(1);
+            for _ in 0..15 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let ch = char::from_u32(0x300 + (state % 112) as u32).unwrap();
+                let mut encoded = [0u8; 4];
+                hoststring.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
+            }
+        }
+        let diff = HostInstruction::encode_message(&[HostInstruction {
+            hoststring,
+            width: 1000,
+            height: 70,
+            echo_ack_num: -1,
+        }]);
+        server.set_pending(diff);
+        let datagrams = server.tick();
+        assert!(
+            datagrams.len() > 512,
+            "fixture must cross the replay-window-sized fragment count"
+        );
+        for chunk in datagrams.chunks(64) {
+            for datagram in chunk {
+                socket.send_to(datagram, client_addr).unwrap();
+            }
+            client.poll().unwrap();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while client.remote_state_num() == 0 && Instant::now() < deadline {
+            client.poll().unwrap();
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        assert_eq!(client.remote_state_num(), 1);
+        let frame = client.remote_framebuffer();
+        let mut painted_x = 0;
+        for y in 0..frame.rows {
+            for x in 0..frame.cols {
+                if frame.cell_at(x, y).is_some_and(|cell| cell.ch == 'X') {
+                    painted_x += 1;
+                }
+            }
+        }
+        assert!(
+            painted_x >= 67_000,
+            "large state was truncated: {painted_x}"
+        );
+    }
+
+    #[test]
     fn initial_timeout_finishes_the_stock_shutdown_handshake_before_exit() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         socket

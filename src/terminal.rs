@@ -13,15 +13,19 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::ansi_apply::{apply_ansi_with_pen, AnsiPen};
 use crate::error::{Error, Result};
-use crate::framebuffer::Framebuffer;
+use crate::framebuffer::{Cell, Framebuffer};
 use crate::pb::HostInstruction;
 #[cfg(test)]
 use crate::transport::RECEIVED_STATE_CAP;
 
-const MAX_TERMINAL_COLS: usize = 1000;
-const MAX_TERMINAL_ROWS: usize = 1000;
-const MAX_TERMINAL_CELLS: usize = 100_000;
 const MAX_REMOTE_STATE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_TERMINAL_COLS: usize = u16::MAX as usize;
+const MAX_TERMINAL_ROWS: usize = u16::MAX as usize;
+/// Leave one quarter of the complete state-history budget for row metadata,
+/// parser state, hyperlinks, and a referenced base frame. Unlike the old
+/// fixed 100,000-cell cap, this follows the actual cell representation and
+/// accepts large-but-valid stock mosh terminal dimensions.
+const MAX_SINGLE_FRAME_CELL_BYTES: usize = 96 * 1024 * 1024;
 const BTREE_STATE_OVERHEAD: usize = 64;
 const ALLOCATION_OVERHEAD: usize = 16;
 
@@ -51,9 +55,15 @@ impl RemoteTerminalState {
                 let cells = cols
                     .checked_mul(rows)
                     .ok_or_else(|| Error::Protocol("remote terminal size overflow".to_string()))?;
+                let cell_bytes =
+                    cells
+                        .checked_mul(std::mem::size_of::<Cell>())
+                        .ok_or_else(|| {
+                            Error::Protocol("remote terminal allocation overflow".to_string())
+                        })?;
                 if cols > MAX_TERMINAL_COLS
                     || rows > MAX_TERMINAL_ROWS
-                    || cells > MAX_TERMINAL_CELLS
+                    || cell_bytes > MAX_SINGLE_FRAME_CELL_BYTES
                 {
                     return Err(Error::Protocol(format!(
                         "remote terminal size {cols}x{rows} exceeds safety limit"
@@ -768,7 +778,7 @@ mod tests {
     fn numbered_state_rejects_oversized_terminal_dimensions() {
         let mut view = TerminalView::new(80, 24);
         let resize = HostInstruction::encode_message(&[HostInstruction {
-            width: 1001,
+            width: 65_536,
             height: 1,
             echo_ack_num: -1,
             ..Default::default()
@@ -776,6 +786,22 @@ mod tests {
 
         let err = view.apply_host_state(0, 1, 0, &resize).unwrap_err();
         assert!(err.to_string().contains("terminal size"));
+    }
+
+    #[test]
+    fn numbered_state_accepts_a_large_official_terminal_within_the_memory_budget() {
+        let mut view = TerminalView::new(80, 24);
+        let resize = HostInstruction::encode_message(&[HostInstruction {
+            width: 1600,
+            height: 900,
+            echo_ack_num: -1,
+            ..Default::default()
+        }]);
+
+        view.apply_host_state(0, 1, 0, &resize).unwrap();
+
+        assert_eq!(view.cols(), 1600);
+        assert_eq!(view.rows(), 900);
     }
 
     #[test]

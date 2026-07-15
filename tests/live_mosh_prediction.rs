@@ -54,8 +54,8 @@ impl Drop for RemoteServerGuard {
     fn drop(&mut self) {
         let destination = format!("{}@{}", self.user, self.host);
         let remote_cleanup = format!(
-            "pkill -TERM -s {} >/dev/null 2>&1 || true; pkill -TERM -s {} >/dev/null 2>&1 || true; kill {} {} >/dev/null 2>&1 || true",
-            self.session_id, self.child_session_id, self.child_pid, self.pid
+            "pkill -TERM -s {} >/dev/null 2>&1 || true; pkill -TERM -s {} >/dev/null 2>&1 || true; kill {} {} >/dev/null 2>&1 || true; rm -f /tmp/moshcatty-live-{}-*",
+            self.session_id, self.child_session_id, self.child_pid, self.pid, self.pid
         );
         let mut command;
         if let Some(key) = self.ssh_key.as_deref() {
@@ -79,6 +79,38 @@ impl Drop for RemoteServerGuard {
 }
 
 impl RemoteServerGuard {
+    fn remote_file_exists(&self, path: &str) -> Option<bool> {
+        let destination = format!("{}@{}", self.user, self.host);
+        let remote_check = format!("if test -f '{path}'; then echo READY; else echo WAITING; fi");
+        let mut command;
+        if let Some(key) = self.ssh_key.as_deref() {
+            command = Command::new("ssh");
+            command.args(["-i", key, "-o", "BatchMode=yes"]);
+        } else {
+            command = Command::new("sshpass");
+            command.args(["-p", self.password.as_deref().unwrap_or_default(), "ssh"]);
+        }
+        let output = command
+            .args([
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "ConnectTimeout=3",
+                &destination,
+                &remote_check,
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        match String::from_utf8_lossy(&output.stdout).trim() {
+            "READY" => Some(true),
+            "WAITING" => Some(false),
+            _ => None,
+        }
+    }
+
     fn is_running(&self) -> Option<bool> {
         let destination = format!("{}@{}", self.user, self.host);
         let remote_check = format!(
@@ -290,7 +322,10 @@ where
 }
 
 fn framebuffer_text(client: &Client) -> String {
-    let frame = client.remote_framebuffer();
+    framebuffer_text_from_frame(client.remote_framebuffer())
+}
+
+fn framebuffer_text_from_frame(frame: &moshcatty::Framebuffer) -> String {
     (0..frame.rows)
         .map(|y| {
             (0..frame.cols)
@@ -347,11 +382,6 @@ impl UdpBlackholeProxy {
                         if !worker_blackholed.load(Ordering::SeqCst) {
                             if let Some(destination) = client {
                                 let _ = socket.send_to(&buf[..len], destination);
-                                // Stock mosh emits every fragment in one loop.
-                                // Pace the local forwarding side just enough
-                                // to avoid turning a valid >1 MiB instruction
-                                // into an artificial loopback receive burst.
-                                thread::sleep(Duration::from_micros(200));
                             }
                         }
                     }
@@ -718,6 +748,48 @@ fn live_client_survives_resize_and_more_keys() {
         "remote child did not start at the requested size; screen={initial_screen:?}"
     );
 
+    // Stock mosh accepts large winsizes carried by the u16 terminal fields.
+    // Exercise the real server path that the old 100,000-cell client cap
+    // rejected, then restore a normal interactive size for content checks.
+    client.resize(1600, 900);
+    let large_deadline = Instant::now() + Duration::from_secs(8);
+    while (
+        client.remote_framebuffer().cols,
+        client.remote_framebuffer().rows,
+    ) != (1600, 900)
+        && Instant::now() < large_deadline
+    {
+        client.poll().expect("poll large resize");
+        thread::sleep(Duration::from_millis(15));
+    }
+    assert_eq!(
+        (
+            client.remote_framebuffer().cols,
+            client.remote_framebuffer().rows
+        ),
+        (1600, 900),
+        "official server did not confirm the large terminal size"
+    );
+    client.resize(100, 30);
+    let restore_deadline = Instant::now() + Duration::from_secs(8);
+    while (
+        client.remote_framebuffer().cols,
+        client.remote_framebuffer().rows,
+    ) != (100, 30)
+        && Instant::now() < restore_deadline
+    {
+        client.poll().expect("poll restored resize");
+        thread::sleep(Duration::from_millis(15));
+    }
+    assert_eq!(
+        (
+            client.remote_framebuffer().cols,
+            client.remote_framebuffer().rows
+        ),
+        (100, 30),
+        "official server did not restore the interactive terminal size"
+    );
+
     client.send_keys(b"printf 'MCTAB_A\\tMCTAB_B\\n'; echo live-ok\n");
     let paint = poll_until(
         &mut client,
@@ -748,6 +820,8 @@ fn live_client_survives_resize_and_more_keys() {
 #[test]
 #[ignore = "live mosh-server; set MOSH_LIVE_HOST and SSH credentials"]
 fn live_large_screen_update_reassembles_against_stock_server() {
+    const LARGE_COLS: u16 = 400;
+    const LARGE_ROWS: u16 = 60;
     let host = env_or_skip("MOSH_LIVE_HOST");
     if host.is_empty() {
         return;
@@ -763,18 +837,24 @@ fn live_large_screen_update_reassembles_against_stock_server() {
     let (port, key, server_guard) =
         start_remote_mosh_server(&host, &user, password.as_deref(), ssh_key.as_deref());
     let proxy = UdpBlackholeProxy::start(&host, port);
-    let mut client = Client::dial_with_size("127.0.0.1", proxy.port, &key, 1000, 70).expect("dial");
-    client.resize(1000, 70);
+    let mut client = Client::dial_with_size("127.0.0.1", proxy.port, &key, LARGE_COLS, LARGE_ROWS)
+        .expect("dial");
+    client.resize(LARGE_COLS, LARGE_ROWS);
     let _ = poll_until(&mut client, Instant::now() + Duration::from_secs(2), |_| {
         false
     });
     proxy.clear_server_packets();
 
-    // Keep the server isolated while it builds a 100,000-cell state with
-    // unique combining marks. This makes stock mosh-server send one compressed
-    // instruction above 1 MiB after the route recovers, including on 1.3.x.
-    let command = b"printf 'MCLARGE_ARMED\\n'; sleep 1; python3 -c 'import hashlib,sys;s=\"\".join(\"X\"+\"\".join(chr(0x300+b%112) for b in hashlib.shake_256(str(i).encode()).digest(15)) for i in range(68000));sys.stdout.buffer.write(s.encode()+b\"\\033[70;1HMCLARGE_DONE\")'\n";
-    client.send_keys(command);
+    // Build a high-entropy printable ASCII screen before announcing readiness,
+    // then wait one second before painting it. The deterministic unit path
+    // covers the 1 MiB protocol boundary; this live path keeps a realistic
+    // multi-fragment update fast enough for public-host verification.
+    let completion_marker = format!("/tmp/moshcatty-live-{}-large-done", server_guard.pid);
+    let command = format!(
+        "python3 -c 'import hashlib,sys,time;b=hashlib.shake_256(b\"moshcatty-large-screen\").digest(23600);s=bytes(33+x%94 for x in b);print(\"MCLARGE_\"+\"ARMED\",flush=True);time.sleep(1);sys.stdout.buffer.write(s+b\"\\033[60;1HMCLARGE_DONE\");sys.stdout.buffer.flush();open(\"{}\",\"w\").close()'\n",
+        completion_marker
+    );
+    client.send_keys(command.as_bytes());
     let armed_deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < armed_deadline {
         client.poll().expect("send large-state command");
@@ -786,6 +866,7 @@ fn live_large_screen_update_reassembles_against_stock_server() {
         }
         thread::sleep(Duration::from_millis(15));
     }
+
     assert!(
         framebuffer_text(&client)
             .lines()
@@ -794,7 +875,20 @@ fn live_large_screen_update_reassembles_against_stock_server() {
     );
     proxy.clear_server_packets();
     proxy.set_blackholed(true);
-    thread::sleep(Duration::from_secs(4));
+    let completion_deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        if server_guard.remote_file_exists(&completion_marker) == Some(true) {
+            break;
+        }
+        assert!(
+            Instant::now() < completion_deadline,
+            "remote host did not finish producing the large terminal state"
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+    // The marker means the PTY accepted every byte. Give stock mosh-server one
+    // more scheduling turn to fold the final read into its framebuffer.
+    thread::sleep(Duration::from_secs(1));
     proxy.set_blackholed(false);
 
     let deadline = Instant::now() + Duration::from_secs(45);
@@ -805,9 +899,9 @@ fn live_large_screen_update_reassembles_against_stock_server() {
         final_screen = framebuffer_text(&client);
         filled_rows = final_screen
             .lines()
-            .filter(|line| line.len() == 1000 && line.bytes().all(|byte| byte == b'X'))
+            .filter(|line| line.len() == usize::from(LARGE_COLS))
             .count();
-        if filled_rows >= 45
+        if filled_rows >= 50
             && final_screen
                 .lines()
                 .any(|line| line.contains("MCLARGE_DONE"))
@@ -824,8 +918,9 @@ fn live_large_screen_update_reassembles_against_stock_server() {
         "large output never reached its sentinel; screen={final_screen:?}"
     );
     assert!(
-        filled_rows >= 45,
-        "large fragmented terminal state was truncated; rows={filled_rows}, wire_bytes={}, row_widths={:?}, instructions={:?}",
+        filled_rows >= 50,
+        "large fragmented terminal state was truncated; rows={filled_rows}, remote_state={}, wire_bytes={}, row_widths={:?}, instructions={:?}",
+        client.remote_state_num(),
         proxy.largest_server_instruction_payload(&key),
         final_screen.lines().map(str::len).collect::<Vec<_>>(),
         proxy.complete_server_instruction_stats(&key)
@@ -835,8 +930,8 @@ fn live_large_screen_update_reassembles_against_stock_server() {
         "stock server never emitted a multi-fragment instruction for the large update"
     );
     assert!(
-        proxy.largest_server_instruction_payload(&key) > 1024 * 1024,
-        "stock server response did not cross the former 1 MiB receive limit"
+        proxy.largest_server_instruction_payload(&key) > 16 * 1024,
+        "stock server response did not produce a representative fragmented update"
     );
     assert!(!client.is_dead(), "client died: {:?}", client.dead_reason());
     assert_graceful_shutdown(&mut client, &server_guard, "large-output session");

@@ -1154,6 +1154,35 @@ fn pipeline_bulk_paste_resets() {
 }
 
 #[test]
+fn stock_sgr_mouse_input_never_paints_coordinate_digits_as_predictions() {
+    let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Experimental);
+    let _ = pipe.on_host_bytes(b"$ ");
+
+    let first = pipe.on_keystroke(b"\x1b[<0;12");
+    let second = pipe.on_keystroke(b";5M");
+
+    assert!(
+        first.is_empty() && second.is_empty(),
+        "an SGR mouse report is one control input and must not locally echo its coordinates"
+    );
+}
+
+#[test]
+fn stock_mac_single_column_symbol_is_locally_predicted() {
+    let mut pipe = DisplayPipeline::new(8, 2, DisplayPreference::Experimental);
+
+    let paint = pipe.on_keystroke("☰".as_bytes());
+
+    assert!(
+        !paint.is_empty(),
+        "stock macOS wcwidth treats U+2630 as one cell"
+    );
+    let shown = pipe.last_shown().expect("predicted display frame");
+    assert_eq!(shown.cell_at(0, 0).unwrap().ch, '☰');
+    assert_eq!(shown.cell_at(0, 0).unwrap().width, 1);
+}
+
+#[test]
 fn stock_last_column_backspace_keeps_the_cursor_on_the_border() {
     let mut pipe = DisplayPipeline::new(24, 8, DisplayPreference::Never);
 

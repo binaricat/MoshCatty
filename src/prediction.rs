@@ -18,9 +18,7 @@
 
 use std::time::{Duration, Instant};
 
-use unicode_width::UnicodeWidthChar;
-
-use crate::framebuffer::Framebuffer;
+use crate::framebuffer::{display_cell_width, Framebuffer};
 
 /// Stock adaptive hysteresis (terminaloverlay.h):
 /// - HIGH: start showing predictions
@@ -501,30 +499,21 @@ impl Predictor {
             self.esc_buf.clear();
             return ArrowParse::Handled(2);
         }
-        // CSI [params] final — L/R arrows accept optional count (CSI n C / CSI n D).
+        // CSI [params] final. The full ECMA-48 parameter range is 0x30..=0x3f,
+        // including private prefixes used by SGR mouse reports (`CSI < ... M`).
+        // Stock's parser keeps the whole sequence together before emitting one
+        // CSI action; never let its coordinate bytes fall back to printable
+        // prediction input.
         let mut j = 2;
-        let mut param: u32 = 0;
-        let mut saw_digit = false;
         while j < bytes.len() {
             let c = bytes[j];
-            if (b'0'..=b'9').contains(&c) {
-                saw_digit = true;
-                param = param.saturating_mul(10).saturating_add(u32::from(c - b'0'));
+            if (0x30..=0x3f).contains(&c) {
                 j += 1;
-                continue;
-            }
-            if c == b';' {
-                // Extra params: skip to final (only first count used for C/D).
-                j += 1;
-                while j < bytes.len() && ((b'0'..=b'9').contains(&bytes[j]) || bytes[j] == b';') {
-                    j += 1;
-                }
                 continue;
             }
             if (b'@'..=b'~').contains(&c) {
                 j += 1;
                 // Stock CSI C/D ignores parameters and always moves by one.
-                let _ = (saw_digit, param);
                 return match c {
                     b'C' => {
                         self.move_cursor_right_n(1, fb);
@@ -1225,7 +1214,7 @@ impl Predictor {
 
 /// Unicode terminal width used to decide whether a glyph is safe to predict.
 fn unicode_width_approx(ch: char) -> i8 {
-    UnicodeWidthChar::width(ch).unwrap_or(0) as i8
+    display_cell_width(ch).unwrap_or(0) as i8
 }
 
 enum ArrowParse {

@@ -38,10 +38,6 @@ const GLITCH_FLAG_THRESHOLD: Duration = Duration::from_millis(5000);
 const GLITCH_REPAIR_COUNT: u32 = 10;
 const GLITCH_REPAIR_MININTERVAL: Duration = Duration::from_millis(150);
 
-/// Bound pending lifetime. Longer than mosh-go's 500ms so high-latency
-/// links can still confirm (stock uses frame-ack expiry, not a short wall clock).
-const PREDICTION_TIMEOUT: Duration = Duration::from_secs(15);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayPreference {
     Always,
@@ -940,8 +936,12 @@ impl Predictor {
         }
     }
 
-    /// mosh-go ExpireStale + stock glitch sampling on oldest pending age.
-    pub fn expire_stale(&mut self, now: Instant) {
+    /// Stock glitch sampling on the oldest pending prediction.
+    ///
+    /// Predictions are retired only by late ACK / host-state validation. A
+    /// wall-clock timeout would make a long-disconnected session lose the
+    /// speculative state that stock mosh keeps until the server catches up.
+    pub fn sample_pending_age(&mut self, now: Instant) {
         // Glitch: true oldest by wall clock (pending is sorted L→R, not by time).
         if let Some(oldest_at) = self.pending.iter().map(|p| p.at).min() {
             let age = now.saturating_duration_since(oldest_at);
@@ -953,27 +953,6 @@ impl Predictor {
                 self.glitch_trigger = GLITCH_REPAIR_COUNT;
                 self.show = true;
             }
-        }
-
-        let cutoff = now.checked_sub(PREDICTION_TIMEOUT).unwrap_or(now);
-        let sent = self.local_frame_sent;
-        let late = self.late_ack();
-        let before = self.pending.len();
-        self.pending.retain(|p| {
-            if p.at >= cutoff {
-                return true;
-            }
-            // Keep frame-Pending preds until late_ack (stock echo_ack).
-            if sent > 0 && late < p.expiration_sent {
-                return true;
-            }
-            false
-        });
-        if self.pending.len() != before && self.pending.is_empty() {
-            // Wall-clock expire of all cells: drop active + cursor latch.
-            // (Frame-Pending cells are kept above, so this is true abandonment.)
-            self.active = false;
-            self.cursors.clear();
         }
     }
 
@@ -1437,17 +1416,21 @@ impl DisplayPipeline {
         let before_pending = self.predictor.pending_len();
         let before_active = self.predictor.active();
         let before_cur = (self.predictor.cur_x(), self.predictor.cur_y());
+        let before_show = self.predictor.should_show();
+        let before_flag = self.predictor.flagging();
         self.predictor.set_frames(sent, early_acked, late_acked);
         // Ack-only packets never call on_host_bytes; still Confirm/Pending drain.
         if before_pending > 0 || before_active {
             self.predictor.confirm(&self.host_fb);
-            self.predictor.expire_stale(Instant::now());
+            self.predictor.sample_pending_age(Instant::now());
             let after_pending = self.predictor.pending_len();
             let after_active = self.predictor.active();
             let after_cur = (self.predictor.cur_x(), self.predictor.cur_y());
             let changed = before_pending != after_pending
                 || before_active != after_active
-                || before_cur != after_cur;
+                || before_cur != after_cur
+                || before_show != self.predictor.should_show()
+                || before_flag != self.predictor.flagging();
             if changed {
                 if self.predictor.should_show() || self.notification.is_some() {
                     self.using_overlay_path = true;
@@ -1531,16 +1514,12 @@ impl DisplayPipeline {
         Vec::new()
     }
 
-    /// Idle tick: expire stale predictions and repaint if the overlay changed.
+    /// Idle tick: sample long-pending predictions and repaint display/flagging.
     pub fn tick(&mut self, now: Instant) -> Vec<u8> {
-        if !self.predictor.should_show() && self.notification.is_none() && !self.using_overlay_path
-        {
-            return Vec::new();
-        }
         let before_len = self.predictor.pending_len();
         let before_flag = self.predictor.flagging();
         let before_show = self.predictor.should_show();
-        self.predictor.expire_stale(now);
+        self.predictor.sample_pending_age(now);
         let after_len = self.predictor.pending_len();
         let after_flag = self.predictor.flagging();
         let after_show = self.predictor.should_show();
@@ -1580,7 +1559,7 @@ impl DisplayPipeline {
         self.predictor
             .set_cursor(self.host_fb.cur_x, self.host_fb.cur_y);
         self.predictor.confirm(&self.host_fb);
-        self.predictor.expire_stale(Instant::now());
+        self.predictor.sample_pending_age(Instant::now());
 
         if !self.predictor.should_show() && self.notification.is_none() {
             // Stock Adaptive: keep background preds; only clear residual overlay paint.
@@ -1612,7 +1591,7 @@ impl DisplayPipeline {
         self.predictor
             .set_cursor(self.host_fb.cur_x, self.host_fb.cur_y);
         self.predictor.confirm(&self.host_fb);
-        self.predictor.expire_stale(Instant::now());
+        self.predictor.sample_pending_age(Instant::now());
 
         if !self.predictor.should_show() && self.notification.is_none() {
             self.using_overlay_path = false;

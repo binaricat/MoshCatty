@@ -98,9 +98,6 @@ impl Assembler {
 
     /// Add a fragment; returns complete message when all pieces arrived.
     pub fn add(&mut self, f: Fragment) -> Option<Vec<u8>> {
-        if self.has_id && f.id < self.current_id {
-            return None; // stale
-        }
         if !self.has_id || f.id != self.current_id {
             self.current_id = f.id;
             self.has_id = true;
@@ -277,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn assembler_stale_id_dropped() {
+    fn assembler_accepts_a_complete_older_instruction_like_stock() {
         let mut a = Assembler::new();
         assert!(a
             .add(Fragment {
@@ -287,14 +284,16 @@ mod tests {
                 payload: b"five".to_vec(),
             })
             .is_some());
-        assert!(a
-            .add(Fragment {
+        assert_eq!(
+            a.add(Fragment {
                 id: 3,
                 fragment_num: 0,
                 is_final: true,
                 payload: b"three".to_vec(),
             })
-            .is_none());
+            .unwrap(),
+            b"three"
+        );
     }
 
     #[test]

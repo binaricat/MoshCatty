@@ -35,6 +35,7 @@ Never require terminfo / Cygwin / system mosh. Pure Rust standalone binary only.
 | Always | forces show, not flagging |
 | Adaptive | hold show while pending or cursor Pending |
 | Experimental | show immediately; discard only a failed cell instead of its prediction band |
+| Lifecycle | keep pending until late ACK / host validation; long-pending cells trigger display and underline |
 | Network status | stock 250ms / 6.5s / 10s thresholds; notification shares the single Diff path |
 
 ## Env
@@ -53,7 +54,6 @@ Never require terminfo / Cygwin / system mosh. Pure Rust standalone binary only.
 | Bit-identical Diff vs stock `new_frame` | Different encoder; cell semantics matter |
 | Title prefix chrome | Netcatty owns the session title |
 | Scroll-history / up-down arrow prediction | Stock also defers / absent |
-| Wall-clock 15s expire | Product safety; Pending still held by late_ack |
 
 ## Modules
 

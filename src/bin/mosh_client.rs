@@ -116,7 +116,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        let mode_paint = display.set_srtt(client.send_interval().or_else(|| client.srtt()));
+        let mode_paint = display.set_srtt(Some(client.send_interval()));
         if !mode_paint.is_empty() {
             stdout.write_all(&mode_paint)?;
             stdout.flush()?;
@@ -168,7 +168,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        // mosh-go ExpireStale: tick even when the server is quiet.
+        // Sample long-pending predictions even when the server is quiet.
         let tick_paint = display.tick(Instant::now());
         if !tick_paint.is_empty() {
             stdout.write_all(&tick_paint)?;

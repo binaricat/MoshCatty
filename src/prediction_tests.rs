@@ -539,7 +539,7 @@ fn glitch_repairs_only_via_quick_credited_correct() {
     p.set_cursor(0, 0);
     p.keystroke(b"a", &blank_fb());
     p.backdate_all_for_test(Duration::from_millis(300));
-    p.expire_stale(Instant::now());
+    p.sample_pending_age(Instant::now());
     assert!(p.glitch_trigger_for_test() >= 10);
     // Fresh quick credited Correct repairs glitch by 1 (not full clear on empty).
     p.keystroke(b"b", &blank_fb());
@@ -826,14 +826,16 @@ fn cursor_only_active_latches_adaptive_show_like_stock() {
 }
 
 #[test]
-fn expire_stale_after_timeout() {
+fn stock_keeps_unconfirmed_predictions_past_fifteen_seconds() {
     let mut p = always();
     p.set_cursor(0, 0);
     p.keystroke(b"a", &blank_fb());
+    let pending = p.pending_len();
     p.backdate_all_for_test(Duration::from_secs(16));
-    p.expire_stale(Instant::now());
-    assert_eq!(p.pending_len(), 0);
-    assert!(!p.active(), "expire must clear active when no cursor pred");
+    p.sample_pending_age(Instant::now());
+    assert_eq!(p.pending_len(), pending);
+    assert!(p.active(), "stock waits for the server's late ACK");
+    assert!(p.flagging(), "a long-pending prediction is underlined");
 }
 
 #[test]
@@ -842,7 +844,7 @@ fn glitch_threshold_raises_trigger() {
     p.set_cursor(0, 0);
     p.keystroke(b"a", &blank_fb());
     p.backdate_oldest_for_test(Duration::from_millis(300));
-    p.expire_stale(Instant::now());
+    p.sample_pending_age(Instant::now());
     assert!(
         p.glitch_trigger_for_test() >= 10,
         "age>=250ms must set glitch_trigger, got {}",
@@ -1074,7 +1076,7 @@ fn pipeline_demote_show_clears_overlay() {
 }
 
 #[test]
-fn pipeline_tick_expires_and_repaints_host_clean() {
+fn pipeline_tick_keeps_and_flags_long_pending_prediction() {
     let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Always);
     pipe.prove_band_for_test();
     let _ = pipe.on_host_bytes(b"\x1b[H");
@@ -1085,17 +1087,57 @@ fn pipeline_tick_expires_and_repaints_host_clean() {
     pipe.predictor_mut_for_test()
         .backdate_all_for_test(Duration::from_secs(16));
     let paint = pipe.tick(Instant::now());
-    let _ = paint;
-    assert_eq!(pipe.predictor().pending_len(), 0);
+    assert!(!paint.is_empty(), "flagging transition repaints the row");
+    assert!(pipe.predictor().pending_len() > 0);
     let shown = pipe.last_shown().unwrap();
-    assert_ne!(
-        (
-            shown.cell_at(0, 0).unwrap().ch,
-            shown.cell_at(0, 0).unwrap().attr.under
-        ),
-        ('z', true),
-        "expired prediction must not remain underlined z on last_shown"
+    assert_eq!(shown.cell_at(0, 0).unwrap().ch, 'z');
+    assert!(
+        shown.cell_at(0, 0).unwrap().attr.under,
+        "stock underlines a prediction that remains unconfirmed"
     );
+}
+
+#[test]
+fn pipeline_tick_reveals_hidden_adaptive_prediction_after_stock_glitch_delay() {
+    let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Adaptive);
+    pipe.prove_band_for_test();
+    let _ = pipe.set_srtt(Some(Duration::from_millis(5)));
+    let _ = pipe.on_host_bytes(b"\x1b[H");
+    assert!(pipe.on_keystroke(b"z").is_empty());
+    assert!(!pipe.predictor().should_show());
+
+    pipe.predictor_mut_for_test()
+        .backdate_all_for_test(Duration::from_millis(300));
+    let paint = pipe.tick(Instant::now());
+
+    assert!(
+        !paint.is_empty(),
+        "the 250ms glitch transition must repaint"
+    );
+    assert!(pipe.predictor().should_show());
+    assert_eq!(pipe.last_shown().unwrap().cell_at(0, 0).unwrap().ch, 'z');
+}
+
+#[test]
+fn pipeline_tick_underlines_hidden_adaptive_prediction_after_five_seconds() {
+    let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Adaptive);
+    pipe.prove_band_for_test();
+    let _ = pipe.set_srtt(Some(Duration::from_millis(5)));
+    let _ = pipe.on_host_bytes(b"\x1b[H");
+    assert!(pipe.on_keystroke(b"z").is_empty());
+
+    pipe.predictor_mut_for_test()
+        .backdate_all_for_test(Duration::from_secs(6));
+    let paint = pipe.tick(Instant::now());
+
+    assert!(
+        !paint.is_empty(),
+        "the five-second flag transition must repaint"
+    );
+    assert!(pipe.predictor().flagging());
+    let shown = pipe.last_shown().unwrap();
+    assert_eq!(shown.cell_at(0, 0).unwrap().ch, 'z');
+    assert!(shown.cell_at(0, 0).unwrap().attr.under);
 }
 
 #[test]
@@ -1844,7 +1886,7 @@ fn stock_glitch_trigger_truthy_forces_show() {
     p.set_cursor(0, 0);
     p.keystroke(b"a", &blank_fb());
     p.backdate_all_for_test(Duration::from_millis(300));
-    p.expire_stale(Instant::now());
+    p.sample_pending_age(Instant::now());
     assert!(p.glitch_trigger_for_test() >= 10);
     // Low SRTT but glitch truthy → show
     p.set_srtt(Some(Duration::from_millis(5)));
@@ -1931,7 +1973,7 @@ fn stock_glitch_repair_only_on_credited_correct() {
     p.backdate_all_for_test(Duration::from_millis(50)); // quick but no-credit
                                                         // Force glitch high
     p.backdate_all_for_test(Duration::from_millis(300));
-    p.expire_stale(Instant::now());
+    p.sample_pending_age(Instant::now());
     let g = p.glitch_trigger_for_test();
     assert!(g >= 10);
     // Confirm blank match (CorrectNoCredit) — must NOT repair glitch
@@ -2036,7 +2078,7 @@ fn stock_reset_preserves_glitch_trigger() {
     p.set_cursor(0, 0);
     p.keystroke(b"a", &blank_fb());
     p.backdate_all_for_test(Duration::from_millis(300));
-    p.expire_stale(Instant::now());
+    p.sample_pending_age(Instant::now());
     let g = p.glitch_trigger_for_test();
     assert!(g >= 10);
     p.reset();

@@ -267,10 +267,10 @@ impl Client {
         self.terminal.echo_ack()
     }
 
-    /// Stock prediction uses ~SRTT/2 clamped to 20–250ms as `send_interval`.
-    pub fn send_interval(&self) -> Option<std::time::Duration> {
-        self.srtt().map(|d| {
-            let half_ms = (d.as_millis() as u64) / 2;
+    /// Stock prediction uses ceil(SRTT/2) clamped to 20–250ms as `send_interval`.
+    pub fn send_interval(&self) -> std::time::Duration {
+        self.srtt().map_or(Duration::from_millis(250), |d| {
+            let half_ms = d.as_nanos().div_ceil(2_000_000) as u64;
             let ms = half_ms.clamp(20, 250);
             std::time::Duration::from_millis(ms)
         })
@@ -729,6 +729,12 @@ mod tests {
 
         assert_eq!(client.remote_framebuffer().cols, 120);
         assert_eq!(client.remote_framebuffer().rows, 40);
+    }
+
+    #[test]
+    fn prediction_starts_with_stock_two_hundred_fifty_ms_send_interval() {
+        let client = Client::dial("127.0.0.1", 9, "AAAAAAAAAAAAAAAAAAAAAA").expect("dial");
+        assert_eq!(client.send_interval(), Duration::from_millis(250));
     }
 
     #[test]

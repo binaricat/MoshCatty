@@ -10,6 +10,7 @@
 //! - timestamp reply uses 0xFFFF as "no reply" (stock network.cc)
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -25,8 +26,8 @@ use crate::fragment::{
 use crate::pb::TransportInstruction;
 
 const PROTOCOL_VERSION: u32 = 2;
-/// Closer to upstream 50–1000 ms band while remaining stable on lossy links.
-const INITIAL_RTO: Duration = Duration::from_millis(500);
+/// Stock starts at the upper RTO cap until the first RTT sample arrives.
+const INITIAL_RTO: Duration = Duration::from_millis(1000);
 const MIN_RTO: Duration = Duration::from_millis(50);
 const MAX_RTO: Duration = Duration::from_millis(1000);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
@@ -36,6 +37,7 @@ const CONGESTION_TIMESTAMP_PENALTY_MS: u16 = 500;
 const SHUTDOWN_RETRIES: u8 = 16;
 const SENT_STATE_CAP: usize = 32;
 const OCB_BLOCK_LIMIT: u64 = 1u64 << 47;
+static NEXT_PACKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Stock uses uint16(-1) = 0xFFFF to mean "no timestamp reply".
 const TS_NO_REPLY: u16 = 0xFFFF;
@@ -92,7 +94,6 @@ pub struct Transport {
     sent_ack_num: u64,
     throwaway_num: u64,
 
-    seq_out: u64,
     instruction_id: u64,
     max_fragment_payload: usize,
     encrypted_blocks: u64,
@@ -160,7 +161,6 @@ impl Transport {
             ack_num: 0,
             sent_ack_num: 0,
             throwaway_num: 0,
-            seq_out: 0,
             instruction_id: 0,
             max_fragment_payload: MAX_FRAGMENT_PAYLOAD,
             encrypted_blocks: 0,
@@ -302,7 +302,7 @@ impl Transport {
 
     fn send_interval(&self) -> Duration {
         let half_ms = if self.rtt_init {
-            (self.srtt.as_millis() as u64) / 2
+            self.srtt.as_nanos().div_ceil(2_000_000) as u64
         } else {
             250
         };
@@ -335,7 +335,8 @@ impl Transport {
             && (!self.pacing_enabled
                 || self.allow_immediate_new_state
                 || now.duration_since(self.last_send) >= self.send_interval());
-        let retransmit_after = if now.duration_since(self.last_recv) < ACTIVE_RETRY_TIMEOUT {
+        let retransmit_after = if now.duration_since(self.last_remote_state) < ACTIVE_RETRY_TIMEOUT
+        {
             self.rto + ACK_DELAY
         } else {
             HEARTBEAT_INTERVAL
@@ -583,16 +584,17 @@ impl Transport {
             self.receiver_quench_until = Some(now + RECEIVER_QUENCH_INTERVAL);
         }
 
+        let advances_latest_remote_state = ti.new_num > self.ack_num;
         self.received_nums.push(ti.new_num);
         // Initial attachment is complete only after a whole, version-correct
         // SSP state has been accepted. One authenticated fragment must not
         // disable the client's 15-second connection timeout forever.
         self.received_authenticated = true;
-        self.last_remote_state = Instant::now();
 
         // Only advance ack_num forward (upstream tracks sorted list + back).
-        if ti.new_num > self.ack_num {
+        if advances_latest_remote_state {
             self.ack_num = ti.new_num;
+            self.last_remote_state = Instant::now();
         }
         if !ti.diff.is_empty() {
             self.pending_ack_since.get_or_insert_with(Instant::now);
@@ -632,10 +634,12 @@ impl Transport {
             return None;
         }
         self.encrypted_blocks += plaintext_blocks;
-        // Upstream unique() starts at 0; we keep starting at 1 for mosh-go parity
-        // on first keepalive (interop-tested). Direction bit is what matters.
-        self.seq_out = self.seq_out.saturating_add(1);
-        let dir_seq = self.to_remote | (self.seq_out & SEQ_MASK);
+        let sequence = NEXT_PACKET_SEQUENCE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .ok()?;
+        let dir_seq = self.to_remote | (sequence & SEQ_MASK);
         let ts = mosh_timestamp_now();
         // Echo peer ts only if recent (~1s), else 0xFFFF (stock "no reply").
         let ts_reply = self.last_ts.take().map_or(TS_NO_REPLY, |timestamp| {
@@ -835,6 +839,31 @@ mod tests {
     }
 
     #[test]
+    fn older_complete_branch_does_not_refresh_latest_remote_contact() {
+        let (mut server, mut client) = pair();
+        server.set_pending(b"state one".to_vec());
+        let state_one = server.tick();
+        server.set_pending(b"state two".to_vec());
+        server.force_next_send();
+        let state_two = server.tick();
+
+        let newest = state_two
+            .iter()
+            .find_map(|datagram| client.recv_state(datagram))
+            .expect("newest branch");
+        assert_eq!(newest.new_num, 2);
+
+        client.last_remote_state = Instant::now() - Duration::from_secs(7);
+        let latest_contact = client.last_remote_state();
+        let older = state_one
+            .iter()
+            .find_map(|datagram| client.recv_state(datagram))
+            .expect("older branch remains a useful base");
+        assert_eq!(older.new_num, 1);
+        assert_eq!(client.last_remote_state(), latest_contact);
+    }
+
+    #[test]
     fn throwaway_num_advances_after_ack() {
         let (mut server, mut client) = pair();
         client.set_pending(b"keys".to_vec());
@@ -982,7 +1011,10 @@ mod tests {
         client.force_next_send();
         assert!(!client.tick().is_empty());
 
-        client.last_recv = Instant::now() - Duration::from_secs(11);
+        // A decrypted fragment is not a new remote state. Stock backs off
+        // based on the newest complete state, even if fragments keep arriving.
+        client.last_recv = Instant::now();
+        client.last_remote_state = Instant::now() - Duration::from_secs(11);
         let state = client.outbound_states.back_mut().unwrap();
         state.last_sent = Some(Instant::now() - Duration::from_secs(2));
         client.last_send = Instant::now() - Duration::from_secs(2);
@@ -1090,10 +1122,38 @@ mod tests {
     }
 
     #[test]
+    fn crypto_sequence_is_unique_across_transports_like_stock() {
+        let (mut server, mut client) = pair();
+        server.force_next_send();
+        client.force_next_send();
+        let server_wire = server.tick().remove(0);
+        let client_wire = client.tick().remove(0);
+        let server_seq = u64::from_be_bytes(server_wire[..8].try_into().unwrap()) & SEQ_MASK;
+        let client_seq = u64::from_be_bytes(client_wire[..8].try_into().unwrap()) & SEQ_MASK;
+        assert_ne!(server_seq, client_seq);
+    }
+
+    #[test]
     fn rto_bounds() {
         let (server, _) = pair();
         let rto = server.rto();
         assert!(rto >= MIN_RTO && rto <= MAX_RTO, "rto={rto:?}");
+    }
+
+    #[test]
+    fn initial_rto_matches_stock_one_second_cap() {
+        let (_server, client) = pair();
+        assert_eq!(client.rto(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn send_interval_rounds_odd_millisecond_rtt_up_like_stock() {
+        let (mut server, _) = pair();
+        server.rtt_init = true;
+        server.srtt = Duration::from_millis(61);
+        assert_eq!(server.send_interval(), Duration::from_millis(31));
+        server.srtt = Duration::from_millis(161);
+        assert_eq!(server.send_interval(), Duration::from_millis(81));
     }
 
     #[test]

@@ -75,7 +75,7 @@ impl EcnSocket {
         let Some(state) = &self.ecn else {
             return self.socket.send_to(bytes, self.peer);
         };
-        state.try_send(
+        let result = state.try_send(
             UdpSockRef::from(&self.socket),
             &Transmit {
                 destination: self.peer,
@@ -84,8 +84,23 @@ impl EcnSocket {
                 segment_size: None,
                 src_ip: None,
             },
-        )?;
-        Ok(bytes.len())
+        );
+        match result {
+            Ok(()) => Ok(bytes.len()),
+            // Windows explicitly rejects sending CE with WSAEINVAL, and some
+            // Windows IPv6 stacks reject the per-packet ECN control message
+            // even after ECN receive setup succeeded. ECN is optional for the
+            // session, so preserve UDP connectivity without the codepoint.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+                ) =>
+            {
+                self.socket.send_to(bytes, self.peer)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn recv(&self, buffer: &mut [u8]) -> io::Result<Vec<ReceivedDatagram>> {
@@ -191,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn congestion_experienced_codepoint_is_received() {
+    fn congestion_experienced_codepoint_is_received_when_the_platform_allows_sending_it() {
         let (sender, receiver) = pair();
         if sender.ecn.is_none() || receiver.ecn.is_none() {
             return;
@@ -200,7 +215,11 @@ mod tests {
             .send_with_ecn(b"congested", EcnCodepoint::Ce)
             .unwrap();
 
-        assert_eq!(receive(&receiver).ecn, Some(EcnCodepoint::Ce));
+        let received = receive(&receiver);
+        #[cfg(windows)]
+        assert_eq!(received.ecn, None);
+        #[cfg(not(windows))]
+        assert_eq!(received.ecn, Some(EcnCodepoint::Ce));
     }
 
     #[test]
@@ -213,8 +232,16 @@ mod tests {
         }
 
         sender.send(b"ipv6-ect0").unwrap();
-        assert_eq!(receive(&receiver).ecn, Some(EcnCodepoint::Ect0));
+        let ect0 = receive(&receiver).ecn;
+        #[cfg(windows)]
+        assert!(matches!(ect0, None | Some(EcnCodepoint::Ect0)));
+        #[cfg(not(windows))]
+        assert_eq!(ect0, Some(EcnCodepoint::Ect0));
         sender.send_with_ecn(b"ipv6-ce", EcnCodepoint::Ce).unwrap();
-        assert_eq!(receive(&receiver).ecn, Some(EcnCodepoint::Ce));
+        let ce = receive(&receiver).ecn;
+        #[cfg(windows)]
+        assert_eq!(ce, None);
+        #[cfg(not(windows))]
+        assert_eq!(ce, Some(EcnCodepoint::Ce));
     }
 }

@@ -22,6 +22,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use moshcatty::{Client, DisplayPipeline, DisplayPreference};
+use zeroize::Zeroize;
 
 fn main() {
     if let Err(e) = run() {
@@ -30,7 +31,29 @@ fn main() {
     }
 }
 
+/// Match stock mosh-client's early process hardening: a crash must not write
+/// the session key or decrypted terminal contents into a Unix core file.
+#[cfg(unix)]
+fn disable_core_dumps() -> io::Result<()> {
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    limit.rlim_cur = 0;
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn disable_core_dumps() -> io::Result<()> {
+    Ok(())
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    disable_core_dumps()?;
+
     #[cfg(all(windows, debug_assertions, feature = "conpty-test-probe"))]
     if env::var_os("MOSHCATTY_CONPTY_TEST").is_some() {
         return run_conpty_input_probe();
@@ -66,7 +89,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let port: u16 = args[1]
         .parse()
         .map_err(|_| format!("invalid port: {}", args[1]))?;
-    let key = env::var("MOSH_KEY").map_err(|_| "MOSH_KEY environment variable is required")?;
+    let mut key = env::var("MOSH_KEY").map_err(|_| "MOSH_KEY environment variable is required")?;
     env::remove_var("MOSH_KEY");
 
     let cols = env::var("COLUMNS")
@@ -80,8 +103,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(term_rows)
         .unwrap_or(24u16);
 
-    let mut client = Client::dial_with_size(&host, port, &key, cols, rows)?;
-    client.resize(cols, rows);
+    let client_result = Client::dial_with_size(&host, port, &key, cols, rows);
+    key.zeroize();
+    let mut client = client_result?;
 
     let running = Arc::new(AtomicBool::new(true));
     install_signal_flag(running.clone());
@@ -806,6 +830,32 @@ fn install_signal_flag(running: Arc<AtomicBool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn core_dump_limit_is_disabled_like_stock_mosh() {
+        struct CoreLimitGuard(libc::rlimit);
+        impl Drop for CoreLimitGuard {
+            fn drop(&mut self) {
+                let _ = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &self.0) };
+            }
+        }
+
+        let mut original: libc::rlimit = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut original) },
+            0
+        );
+        let _restore = CoreLimitGuard(original);
+
+        disable_core_dumps().expect("disable core dumps");
+        let mut hardened: libc::rlimit = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut hardened) },
+            0
+        );
+        assert_eq!(hardened.rlim_cur, 0);
+    }
 
     #[test]
     fn default_local_escape_quits_without_forwarding_control_bytes() {

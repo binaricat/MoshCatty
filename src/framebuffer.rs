@@ -185,6 +185,12 @@ pub struct Framebuffer {
     pub cur_x: usize,
     pub cur_y: usize,
     pub cursor_visible: bool,
+    /// ANSI mode 4: printable cells shift existing content to the right.
+    pub insert_mode: bool,
+    /// DEC mode 7: printing past the last column wraps onto the next row.
+    pub auto_wrap_mode: bool,
+    /// DEC mode 6: absolute row addressing is relative to scroll margins.
+    pub origin_mode: bool,
     /// DEC private modes that are part of the remote terminal state.
     pub reverse_video: bool,
     pub bracketed_paste: bool,
@@ -194,6 +200,9 @@ pub struct Framebuffer {
     /// Active scrolling margins, inclusive and zero-indexed.
     pub scroll_top: usize,
     pub scroll_bottom: usize,
+    /// DEC horizontal tab stops. Stock terminals start with one every eight
+    /// columns and allow applications to replace or clear them.
+    tab_stops: Vec<bool>,
     /// Stateful side effects emitted by stock mosh's Display::new_frame.
     pub bell_count: u64,
     pub icon_name: Option<Vec<u8>>,
@@ -223,6 +232,9 @@ impl Framebuffer {
             cur_x: 0,
             cur_y: 0,
             cursor_visible: true,
+            insert_mode: false,
+            auto_wrap_mode: true,
+            origin_mode: false,
             reverse_video: false,
             bracketed_paste: false,
             mouse_reporting_mode: 0,
@@ -230,6 +242,9 @@ impl Framebuffer {
             mouse_encoding_mode: 0,
             scroll_top: 0,
             scroll_bottom: rows - 1,
+            tab_stops: (0..cols)
+                .map(|column| column > 0 && column % 8 == 0)
+                .collect(),
             bell_count: 0,
             icon_name: None,
             window_title: None,
@@ -264,11 +279,17 @@ impl Framebuffer {
         next.cur_x = self.cur_x.min(cols.saturating_sub(1));
         next.cur_y = self.cur_y.min(rows.saturating_sub(1));
         next.cursor_visible = self.cursor_visible;
+        next.insert_mode = self.insert_mode;
+        next.auto_wrap_mode = self.auto_wrap_mode;
+        next.origin_mode = self.origin_mode;
         next.reverse_video = self.reverse_video;
         next.bracketed_paste = self.bracketed_paste;
         next.mouse_reporting_mode = self.mouse_reporting_mode;
         next.mouse_focus_event = self.mouse_focus_event;
         next.mouse_encoding_mode = self.mouse_encoding_mode;
+        for column in 0..copy_cols {
+            next.tab_stops[column] = self.tab_stops[column];
+        }
         next.bell_count = self.bell_count;
         next.icon_name = self.icon_name.clone();
         next.window_title = self.window_title.clone();
@@ -306,6 +327,43 @@ impl Framebuffer {
         self.combining_x = self.cur_x;
         self.combining_y = self.cur_y;
         self.combining_valid = self.cur_x < self.cols && self.cur_y < self.rows;
+    }
+
+    pub(crate) fn set_tab_stop(&mut self, column: usize) {
+        if let Some(stop) = self.tab_stops.get_mut(column) {
+            *stop = true;
+        }
+    }
+
+    pub(crate) fn clear_tab_stop(&mut self, column: usize) {
+        if let Some(stop) = self.tab_stops.get_mut(column) {
+            *stop = false;
+        }
+    }
+
+    pub(crate) fn clear_all_tab_stops(&mut self) {
+        self.tab_stops.fill(false);
+    }
+
+    pub(crate) fn next_tab_stop(&self, count: usize) -> usize {
+        let mut column = self.cur_x;
+        for _ in 0..count.max(1) {
+            column = ((column + 1)..self.cols)
+                .find(|candidate| self.tab_stops[*candidate])
+                .unwrap_or_else(|| self.cols.saturating_sub(1));
+        }
+        column
+    }
+
+    pub(crate) fn previous_tab_stop(&self, count: usize) -> usize {
+        let mut column = self.cur_x;
+        for _ in 0..count.max(1) {
+            column = (0..column)
+                .rev()
+                .find(|candidate| self.tab_stops[*candidate])
+                .unwrap_or(0);
+        }
+        column
     }
 
     pub(crate) fn fill_all(&mut self, blank: &Cell) {
@@ -380,6 +438,12 @@ impl Framebuffer {
     pub(crate) fn metadata_storage_bytes(&self) -> usize {
         self.rows_data.capacity() * std::mem::size_of::<Arc<Vec<Cell>>>()
             + ALLOCATION_OVERHEAD
+            + self.tab_stops.capacity() * std::mem::size_of::<bool>()
+            + if self.tab_stops.capacity() > 0 {
+                ALLOCATION_OVERHEAD
+            } else {
+                0
+            }
             + self.hyperlinks.capacity() * std::mem::size_of::<Hyperlink>()
             + if self.hyperlinks.capacity() > 0 {
                 ALLOCATION_OVERHEAD

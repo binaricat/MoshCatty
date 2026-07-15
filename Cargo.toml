@@ -25,14 +25,16 @@ name = "moshcatty"
 path = "src/lib.rs"
 
 [dependencies]
-aes = "0.8"
+aes = { version = "0.8", features = ["zeroize"] }
 base64 = "0.22"
 flate2 = "1"
 getrandom = "0.2"
 thiserror = "2"
 libc = "0.2"
 quinn-udp = { version = "=0.5.14", default-features = false }
+socket2 = "0.6"
 unicode-width = "0.2.2"
+zeroize = { version = "=1.8.2", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 hex = "0.4"

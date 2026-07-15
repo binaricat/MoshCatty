@@ -2,6 +2,25 @@ use std::io::{self, IoSliceMut};
 use std::net::{SocketAddr, UdpSocket};
 
 use quinn_udp::{EcnCodepoint, RecvMeta, Transmit, UdpSockRef, UdpSocketState};
+use socket2::SockRef;
+
+/// A complete stock-mosh instruction can be 4 MiB before protocol decoding.
+/// Leave room for fragment headers and a concurrent retransmission burst so
+/// the kernel queue does not discard fragments before the poll loop sees them.
+const DESIRED_RECEIVE_QUEUE_BYTES: usize = 8 * 1024 * 1024;
+
+fn request_large_receive_queue(socket: &UdpSocket) {
+    let socket = SockRef::from(socket);
+    for bytes in [
+        DESIRED_RECEIVE_QUEUE_BYTES,
+        4 * 1024 * 1024,
+        2 * 1024 * 1024,
+    ] {
+        if socket.set_recv_buffer_size(bytes).is_ok() {
+            break;
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReceivedDatagram {
@@ -24,6 +43,10 @@ impl EcnSocket {
             "[::]:0"
         })?;
         socket.set_nonblocking(true)?;
+        // The OS may clamp this to its configured maximum. Requesting the
+        // larger queue is still important when the default UDP queue is much
+        // smaller than one legal mosh instruction.
+        request_large_receive_queue(&socket);
         // Old Windows versions and restricted sandboxes may not expose the
         // ancillary-data APIs. Preserve basic UDP operation in that case.
         let ecn = UdpSocketState::new(UdpSockRef::from(&socket)).ok();

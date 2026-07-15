@@ -22,6 +22,7 @@ use std::io::{Read, Write};
 use crate::crypto::{self, Ocb, DIR_TO_CLIENT, DIR_TO_SERVER, MIN_DATAGRAM, SEQ_MASK};
 use crate::fragment::{
     fragmentize_with_payload, Assembler, Fragment, FRAGMENT_HEADER_SIZE, MAX_FRAGMENT_PAYLOAD,
+    MAX_INSTRUCTION_BYTES,
 };
 use crate::pb::TransportInstruction;
 
@@ -79,6 +80,11 @@ pub struct Transport {
     sent_num: u64,
     acked_by_remote: u64,
     outbound_states: VecDeque<OutboundState>,
+    /// Send timestamps for every SSP state, including empty ACK/heartbeat
+    /// states. Stock uses the timestamp of the state named by an ACK when it
+    /// reports end-to-end roundtrip reachability.
+    sent_state_times: VecDeque<(u64, Instant)>,
+    outbound_instruction_too_large: bool,
     outbound_overflowed: bool,
     rebase_required: bool,
     pacing_enabled: bool,
@@ -138,6 +144,7 @@ impl Transport {
     }
 
     fn new(ocb: Ocb, is_server: bool) -> Self {
+        let now = Instant::now();
         let (to_remote, to_local) = if is_server {
             (DIR_TO_CLIENT, DIR_TO_SERVER)
         } else {
@@ -150,6 +157,8 @@ impl Transport {
             sent_num: 0,
             acked_by_remote: 0,
             outbound_states: VecDeque::new(),
+            sent_state_times: VecDeque::from([(0, now)]),
+            outbound_instruction_too_large: false,
             outbound_overflowed: false,
             rebase_required: false,
             pacing_enabled: !is_server,
@@ -169,13 +178,13 @@ impl Transport {
             expected_receiver_seq_set: false,
             seen_seqs: HashSet::new(),
             seen_seq_order: Vec::new(),
-            last_send: Instant::now(),
-            last_recv: Instant::now(),
-            last_remote_state: Instant::now(),
+            last_send: now,
+            last_recv: now,
+            last_remote_state: now,
             received_authenticated: false,
-            last_roundtrip_success: Instant::now(),
+            last_roundtrip_success: now,
             last_ts: None,
-            last_ts_at: Instant::now(),
+            last_ts_at: now,
             srtt: Duration::ZERO,
             rttvar: Duration::ZERO,
             rto: INITIAL_RTO,
@@ -195,12 +204,26 @@ impl Transport {
     }
 
     pub fn set_pending(&mut self, diff: Vec<u8>) -> u64 {
+        self.set_pending_from(self.acked_by_remote, diff)
+    }
+
+    pub(crate) fn set_pending_from(&mut self, old_num: u64, diff: Vec<u8>) -> u64 {
         if self.shutdown_in_progress {
             return self.sent_num;
         }
+        let old_num = if old_num == self.acked_by_remote
+            || self
+                .outbound_states
+                .iter()
+                .any(|state| state.new_num == old_num)
+        {
+            old_num
+        } else {
+            self.acked_by_remote
+        };
         self.sent_num = self.sent_num.saturating_add(1);
         self.outbound_states.push_back(OutboundState {
-            old_num: self.acked_by_remote,
+            old_num,
             new_num: self.sent_num,
             diff,
             last_sent: None,
@@ -211,6 +234,38 @@ impl Transport {
             self.outbound_overflowed = true;
         }
         self.sent_num
+    }
+
+    pub(crate) fn prospective_base_num(&self) -> Option<u64> {
+        let now = Instant::now();
+        let maximum_age = self.rto + ACK_DELAY;
+        let mut candidate = None;
+        for state in &self.outbound_states {
+            match state.last_sent {
+                Some(sent_at) if now.saturating_duration_since(sent_at) < maximum_age => {
+                    candidate = Some(state.new_num);
+                }
+                _ => break,
+            }
+        }
+        candidate
+    }
+
+    pub(crate) fn prospective_chain_expired(&self) -> bool {
+        let Some(latest) = self.outbound_states.back() else {
+            return false;
+        };
+        if latest.old_num == self.acked_by_remote {
+            return false;
+        }
+        match self.prospective_base_num() {
+            Some(freshest_prefix) => freshest_prefix < latest.old_num,
+            None => true,
+        }
+    }
+
+    pub(crate) fn take_outbound_instruction_too_large(&mut self) -> bool {
+        std::mem::take(&mut self.outbound_instruction_too_large)
     }
 
     pub fn acked_by_remote(&self) -> u64 {
@@ -288,6 +343,10 @@ impl Transport {
         self.shutdown_in_progress && self.acked_by_remote == u64::MAX
     }
 
+    pub fn shutdown_in_progress(&self) -> bool {
+        self.shutdown_in_progress
+    }
+
     pub fn counterparty_shutdown_ack_sent(&self) -> bool {
         self.counterparty_shutdown_ack_sent
     }
@@ -298,6 +357,61 @@ impl Transport {
                 || self
                     .shutdown_started
                     .is_some_and(|started| started.elapsed() >= ACTIVE_RETRY_TIMEOUT))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backdate_last_remote_state_for_test(&mut self, elapsed: Duration) {
+        self.last_remote_state = Instant::now() - elapsed;
+    }
+
+    #[cfg(test)]
+    fn backdate_sent_state_for_test(&mut self, state_num: u64, elapsed: Duration) {
+        let sent_at = Instant::now() - elapsed;
+        if let Some(state) = self
+            .outbound_states
+            .iter_mut()
+            .find(|state| state.new_num == state_num)
+        {
+            state.last_sent = Some(sent_at);
+        }
+        if let Some((_, timestamp)) = self
+            .sent_state_times
+            .iter_mut()
+            .find(|(num, _)| *num == state_num)
+        {
+            *timestamp = sent_at;
+        }
+    }
+
+    fn record_sent_state_time(&mut self, state_num: u64, sent_at: Instant) {
+        if let Some((_, timestamp)) = self
+            .sent_state_times
+            .iter_mut()
+            .find(|(num, _)| *num == state_num)
+        {
+            *timestamp = sent_at;
+            return;
+        }
+
+        self.sent_state_times.push_back((state_num, sent_at));
+        if self.sent_state_times.len() > SENT_STATE_CAP {
+            let middle = self.sent_state_times.len() - 16;
+            self.sent_state_times.remove(middle);
+        }
+    }
+
+    fn process_roundtrip_ack(&mut self, ack_num: u64) -> bool {
+        let matched = self
+            .sent_state_times
+            .iter()
+            .position(|(state_num, _)| *state_num == ack_num);
+        if let Some(position) = matched {
+            self.sent_state_times.drain(..position);
+        }
+        if let Some((_, sent_at)) = self.sent_state_times.front() {
+            self.last_roundtrip_success = *sent_at;
+        }
+        matched.is_some()
     }
 
     fn send_interval(&self) -> Duration {
@@ -433,7 +547,18 @@ impl Transport {
         self.sent_ack_num = self.ack_num;
 
         let pb_data = ti.encode();
+        if pb_data.len() > MAX_INSTRUCTION_BYTES {
+            self.outbound_instruction_too_large = true;
+            self.last_send = now;
+            return Vec::new();
+        }
         let compressed = zlib_compress(&pb_data);
+        let fragment_count = compressed.len().max(1).div_ceil(self.max_fragment_payload);
+        if compressed.len() > MAX_INSTRUCTION_BYTES || fragment_count > 0x8000 {
+            self.outbound_instruction_too_large = true;
+            self.last_send = now;
+            return Vec::new();
+        }
         self.instruction_id = self.instruction_id.saturating_add(1);
         let frags =
             fragmentize_with_payload(self.instruction_id, &compressed, self.max_fragment_payload);
@@ -446,7 +571,10 @@ impl Transport {
             };
             datagrams.push(datagram);
         }
-        self.last_send = Instant::now();
+        if !datagrams.is_empty() {
+            self.record_sent_state_time(new_num, now);
+        }
+        self.last_send = now;
         datagrams
     }
 
@@ -532,10 +660,16 @@ impl Transport {
             return None;
         }
 
+        // Stock derives its end-to-end reachability clock from the send time
+        // of the ACKed SSP state, not from the arrival time of this packet.
+        let acknowledged_state_is_known = self.process_roundtrip_ack(ti.ack_num);
+
         // Process ack from remote.
-        if ti.ack_num > self.acked_by_remote && ti.ack_num <= self.sent_num {
+        if acknowledged_state_is_known
+            && ti.ack_num > self.acked_by_remote
+            && ti.ack_num <= self.sent_num
+        {
             self.acked_by_remote = ti.ack_num;
-            self.last_roundtrip_success = Instant::now();
             // Advance local throwaway: peer has everything ≤ acked.
             self.local_throwaway = self.acked_by_remote;
             self.outbound_states
@@ -722,7 +856,7 @@ fn zlib_decompress(data: &[u8]) -> Option<Vec<u8>> {
         match dec.read(&mut limited) {
             Ok(0) => break,
             Ok(n) => {
-                if out.len() + n > (1 << 20) {
+                if out.len() + n > MAX_INSTRUCTION_BYTES {
                     return None;
                 }
                 out.extend_from_slice(&limited[..n]);
@@ -746,6 +880,62 @@ mod tests {
         let server = Transport::new_server(Ocb::new(&key).unwrap());
         let client = Transport::new_client(Ocb::new(&key).unwrap());
         (server, client)
+    }
+
+    #[test]
+    fn zlib_decompress_accepts_official_states_larger_than_one_mibibyte() {
+        let payload = vec![0x41; (1 << 20) + MAX_FRAGMENT_PAYLOAD];
+        let compressed = zlib_compress(&payload);
+        let decoded = zlib_decompress(&compressed)
+            .expect("official-size decompressed state should be accepted");
+
+        assert_eq!(decoded.len(), payload.len());
+        assert!(decoded == payload, "decompressed state must remain exact");
+    }
+
+    #[test]
+    fn zlib_decompress_accepts_the_official_four_mibibyte_boundary() {
+        let payload = vec![0x42; MAX_INSTRUCTION_BYTES];
+        let compressed = zlib_compress(&payload);
+        let decoded = zlib_decompress(&compressed)
+            .expect("the official decompressor boundary should be accepted");
+
+        assert_eq!(decoded.len(), MAX_INSTRUCTION_BYTES);
+        assert!(decoded == payload, "boundary payload must remain exact");
+    }
+
+    #[test]
+    fn zlib_decompress_rejects_states_larger_than_the_official_boundary() {
+        let payload = vec![0x43; MAX_INSTRUCTION_BYTES + 1];
+        let compressed = zlib_compress(&payload);
+
+        assert!(zlib_decompress(&compressed).is_none());
+    }
+
+    #[test]
+    fn outbound_compression_rejects_states_larger_than_the_official_boundary() {
+        let (mut sender, _) = pair();
+        let mut payload = vec![0u8; MAX_INSTRUCTION_BYTES + 1024];
+        let mut state = 0x9e37_79b9_u32;
+        for byte in &mut payload {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *byte = state as u8;
+        }
+        sender.set_pending(payload);
+
+        assert!(sender.tick().is_empty());
+        assert!(sender.take_outbound_instruction_too_large());
+    }
+
+    #[test]
+    fn outbound_rejects_highly_compressible_states_above_the_decoded_boundary() {
+        let (mut sender, _) = pair();
+        sender.set_pending(vec![0; MAX_INSTRUCTION_BYTES + 1024]);
+
+        assert!(sender.tick().is_empty());
+        assert!(sender.take_outbound_instruction_too_large());
     }
 
     #[test]
@@ -1294,6 +1484,101 @@ mod tests {
             let _ = client.recv(&dg);
         }
         assert_eq!(client.ack_num(), 2);
+    }
+
+    #[test]
+    fn roundtrip_success_uses_the_acked_state_send_time_like_stock() {
+        let (mut server, mut client) = pair();
+        client.set_pending(b"old outbound state".to_vec());
+        let client_datagrams = client.tick();
+        client.backdate_sent_state_for_test(1, Duration::from_secs(7));
+        for datagram in client_datagrams {
+            let _ = server.recv_state(&datagram);
+        }
+
+        server.force_next_send();
+        for datagram in server.tick() {
+            let _ = client.recv_state(&datagram);
+        }
+
+        assert_eq!(client.acked_by_remote(), 1);
+        assert!(
+            client.last_roundtrip_success().elapsed() >= Duration::from_secs(6),
+            "a late ACK must preserve the original send time"
+        );
+    }
+
+    #[test]
+    fn prospective_chain_expires_back_to_the_known_receiver_base() {
+        let (mut sender, _) = pair();
+        sender.pacing_enabled = false;
+        sender.set_pending_from(0, vec![b'a'; 1_200]);
+        assert!(!sender.tick().is_empty());
+        sender.set_pending_from(1, b"b".to_vec());
+        assert!(!sender.tick().is_empty());
+        assert!(!sender.prospective_chain_expired());
+
+        sender.backdate_sent_state_for_test(1, Duration::from_secs(2));
+        assert!(sender.prospective_chain_expired());
+    }
+
+    #[test]
+    fn stale_first_link_invalidates_an_otherwise_fresh_prospective_chain() {
+        let (mut sender, _) = pair();
+        sender.pacing_enabled = false;
+        sender.set_pending_from(0, vec![b'a'; 1_200]);
+        assert!(!sender.tick().is_empty());
+        sender.set_pending_from(1, b"b".to_vec());
+        assert!(!sender.tick().is_empty());
+        sender.set_pending_from(2, b"c".to_vec());
+        assert!(!sender.tick().is_empty());
+
+        sender.backdate_sent_state_for_test(1, Duration::from_secs(2));
+        assert_eq!(sender.prospective_base_num(), None);
+        assert!(sender.prospective_chain_expired());
+    }
+
+    #[test]
+    fn ack_for_a_state_number_that_was_never_sent_is_ignored() {
+        let (mut peer, mut sender) = pair();
+        sender.set_pending(b"superseded before send".to_vec());
+        sender.set_pending(b"actually sent".to_vec());
+        let sent = sender.tick();
+        assert_eq!(sender.sent_num(), 2);
+        assert!(!sent.is_empty());
+
+        peer.ack_num = 1;
+        peer.force_next_send();
+        for datagram in peer.tick() {
+            let _ = sender.recv_state(&datagram);
+        }
+
+        assert_eq!(sender.acked_by_remote(), 0);
+    }
+
+    #[test]
+    fn ack_for_a_culled_middle_state_is_ignored_like_stock() {
+        let (mut sender, mut peer) = pair();
+        for state in 1..=32 {
+            sender.set_pending(vec![state]);
+            assert!(!sender.tick().is_empty());
+        }
+        assert_eq!(sender.sent_num(), 32);
+        assert!(
+            !sender
+                .sent_state_times
+                .iter()
+                .any(|(state_num, _)| *state_num == 17),
+            "test must target stock's culled middle state"
+        );
+
+        peer.ack_num = 17;
+        peer.force_next_send();
+        for datagram in peer.tick() {
+            let _ = sender.recv_state(&datagram);
+        }
+
+        assert_eq!(sender.acked_by_remote(), 0);
     }
 
     #[test]

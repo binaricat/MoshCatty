@@ -15,6 +15,7 @@
 
 use moshcatty::terminal::strip_ansi;
 use moshcatty::{Client, ConnectionStatus, DisplayPipeline, DisplayPreference, Ocb};
+use socket2::SockRef;
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::process::Command;
@@ -40,14 +41,17 @@ struct RemoteServerGuard {
     password: Option<String>,
     ssh_key: Option<String>,
     pid: u32,
+    session_id: u32,
+    child_pid: u32,
+    child_session_id: u32,
 }
 
 impl Drop for RemoteServerGuard {
     fn drop(&mut self) {
         let destination = format!("{}@{}", self.user, self.host);
         let remote_cleanup = format!(
-            "pkill -TERM -P {} >/dev/null 2>&1 || true; kill {} >/dev/null 2>&1 || true",
-            self.pid, self.pid
+            "pkill -TERM -s {} >/dev/null 2>&1 || true; pkill -TERM -s {} >/dev/null 2>&1 || true; kill {} {} >/dev/null 2>&1 || true",
+            self.session_id, self.child_session_id, self.child_pid, self.pid
         );
         let mut command;
         if let Some(key) = self.ssh_key.as_deref() {
@@ -70,6 +74,67 @@ impl Drop for RemoteServerGuard {
     }
 }
 
+impl RemoteServerGuard {
+    fn is_running(&self) -> Option<bool> {
+        let destination = format!("{}@{}", self.user, self.host);
+        let remote_check = format!(
+            "if kill -0 {} >/dev/null 2>&1 || kill -0 {} >/dev/null 2>&1 || ps -eo sid= | awk -v server_sid={} -v child_sid={} '$1 == server_sid || $1 == child_sid {{ found=1 }} END {{ exit(found ? 0 : 1) }}'; then echo RUNNING; else echo STOPPED; fi",
+            self.pid, self.child_pid, self.session_id, self.child_session_id
+        );
+        let mut command;
+        if let Some(key) = self.ssh_key.as_deref() {
+            command = Command::new("ssh");
+            command.args(["-i", key, "-o", "BatchMode=yes"]);
+        } else {
+            command = Command::new("sshpass");
+            command.args(["-p", self.password.as_deref().unwrap_or_default(), "ssh"]);
+        }
+        let output = command
+            .args([
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "ConnectTimeout=3",
+                &destination,
+                &remote_check,
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        match String::from_utf8_lossy(&output.stdout).trim() {
+            "RUNNING" => Some(true),
+            "STOPPED" => Some(false),
+            _ => None,
+        }
+    }
+}
+
+fn assert_graceful_shutdown(client: &mut Client, server: &RemoteServerGuard, label: &str) {
+    let acknowledged = client
+        .graceful_shutdown(Duration::from_secs(10))
+        .expect("graceful shutdown");
+    if acknowledged {
+        return;
+    }
+
+    // Stock mosh-server sends one final shutdown ACK and then exits. A local
+    // VM/network can lose that last UDP datagram after the server closes its
+    // socket. In that case verify the requested outcome directly: the remote
+    // server and child session must actually be gone.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        match server.is_running() {
+            Some(false) => return,
+            Some(true) => {}
+            None => panic!("could not verify remote process state after {label} shutdown"),
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!("stock server neither acknowledged nor completed {label} shutdown");
+}
+
 /// Start remote mosh-server via SSH; return (port, key).
 fn start_remote_mosh_server(
     host: &str,
@@ -77,7 +142,7 @@ fn start_remote_mosh_server(
     password: Option<&str>,
     ssh_key: Option<&str>,
 ) -> (u16, String, RemoteServerGuard) {
-    let remote_cmd = "mosh-server new -s -p 60000:60100 -- /bin/bash --noprofile --norc -c 'export PS1=\"$ \"; exec bash --noprofile --norc'";
+    let remote_cmd = "mosh-server new -s -p 60000:60100 -- /bin/bash --noprofile --norc -c 'printf \"MCINITIAL_SIZE:%s\\n\" \"$(stty size)\"; export PS1=\"$ \"; exec bash --noprofile --norc'";
     let destination = format!("{user}@{host}");
     let mut command;
     if let Some(key) = ssh_key {
@@ -112,12 +177,82 @@ fn start_remote_mosh_server(
                 .ok()
         })
         .unwrap_or_else(|| panic!("no detached mosh-server pid in remote output:\n{combined}"));
+    let session_query = format!("ps -o sid= -p {detached_pid}");
+    let mut session_command;
+    if let Some(key) = ssh_key {
+        session_command = Command::new("ssh");
+        session_command.args(["-i", key, "-o", "BatchMode=yes"]);
+    } else {
+        session_command = Command::new("sshpass");
+        session_command.args(["-p", password.expect("password or SSH key"), "ssh"]);
+    }
+    let session_output = session_command
+        .args([
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "ConnectTimeout=3",
+            &destination,
+            &session_query,
+        ])
+        .output()
+        .expect("query detached mosh-server session id");
+    assert!(
+        session_output.status.success(),
+        "could not query detached mosh-server session id"
+    );
+    let session_id = String::from_utf8_lossy(&session_output.stdout)
+        .trim()
+        .parse::<u32>()
+        .expect("detached mosh-server session id");
+    let child_query = format!(
+        "child=$(pgrep -P {detached_pid} | head -n 1); if [ -n \"$child\" ]; then printf '%s %s\\n' \"$child\" \"$(ps -o sid= -p \"$child\")\"; fi"
+    );
+    let child_deadline = Instant::now() + Duration::from_secs(3);
+    let (child_pid, child_session_id) = loop {
+        let mut child_command;
+        if let Some(key) = ssh_key {
+            child_command = Command::new("ssh");
+            child_command.args(["-i", key, "-o", "BatchMode=yes"]);
+        } else {
+            child_command = Command::new("sshpass");
+            child_command.args(["-p", password.expect("password or SSH key"), "ssh"]);
+        }
+        let child_output = child_command
+            .args([
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "ConnectTimeout=3",
+                &destination,
+                &child_query,
+            ])
+            .output()
+            .expect("query detached mosh-server child");
+        if child_output.status.success() {
+            let values = String::from_utf8_lossy(&child_output.stdout)
+                .split_whitespace()
+                .filter_map(|value| value.parse::<u32>().ok())
+                .collect::<Vec<_>>();
+            if values.len() == 2 {
+                break (values[0], values[1]);
+            }
+        }
+        assert!(
+            Instant::now() < child_deadline,
+            "could not query detached mosh-server PTY child"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
     let server_guard = RemoteServerGuard {
         host: host.to_string(),
         user: user.to_string(),
         password: password.map(str::to_string),
         ssh_key: ssh_key.map(str::to_string),
         pid: detached_pid,
+        session_id,
+        child_pid,
+        child_session_id,
     };
     // MOSH CONNECT <port> <key>
     for line in combined.lines() {
@@ -180,6 +315,9 @@ impl UdpBlackholeProxy {
             .find(SocketAddr::is_ipv4)
             .expect("live blackhole test requires an IPv4 server address");
         let socket = UdpSocket::bind("0.0.0.0:0").expect("bind UDP proxy");
+        SockRef::from(&socket)
+            .set_recv_buffer_size(4 * 1024 * 1024)
+            .expect("large UDP proxy receive queue");
         let port = socket.local_addr().expect("proxy address").port();
         socket
             .set_read_timeout(Some(Duration::from_millis(20)))
@@ -203,6 +341,11 @@ impl UdpBlackholeProxy {
                         if !worker_blackholed.load(Ordering::SeqCst) {
                             if let Some(destination) = client {
                                 let _ = socket.send_to(&buf[..len], destination);
+                                // Stock mosh emits every fragment in one loop.
+                                // Pace the local forwarding side just enough
+                                // to avoid turning a valid >1 MiB instruction
+                                // into an artificial loopback receive burst.
+                                thread::sleep(Duration::from_micros(200));
                             }
                         }
                     }
@@ -268,6 +411,36 @@ impl UdpBlackholeProxy {
             .values()
             .any(|fragment_nums| fragment_nums.len() > 1)
     }
+
+    fn largest_server_instruction_payload(&self, key: &str) -> usize {
+        let ocb = Ocb::from_base64(key).expect("live MOSH_KEY");
+        let mut fragments_by_instruction: HashMap<u64, HashMap<u16, usize>> = HashMap::new();
+        for packet in self
+            .server_packets
+            .lock()
+            .expect("server packet capture")
+            .iter()
+        {
+            let Some((_sequence, plaintext)) = ocb.open_datagram(packet) else {
+                continue;
+            };
+            if plaintext.len() < 14 {
+                continue;
+            }
+            let instruction_id = u64::from_be_bytes(plaintext[4..12].try_into().unwrap());
+            let fragment_num = u16::from_be_bytes(plaintext[12..14].try_into().unwrap()) & 0x7fff;
+            fragments_by_instruction
+                .entry(instruction_id)
+                .or_default()
+                .entry(fragment_num)
+                .or_insert(plaintext.len() - 14);
+        }
+        fragments_by_instruction
+            .values()
+            .map(|fragments| fragments.values().sum())
+            .max()
+            .unwrap_or_default()
+    }
 }
 
 impl Drop for UdpBlackholeProxy {
@@ -294,7 +467,7 @@ fn live_echo_and_prediction_pipeline_no_double_glyph() {
         return;
     }
 
-    let (port, key, _server_guard) =
+    let (port, key, server_guard) =
         start_remote_mosh_server(&host, &user, password.as_deref(), ssh_key.as_deref());
     eprintln!("live: MOSH CONNECT {port} (key redacted)");
 
@@ -423,12 +596,7 @@ fn live_echo_and_prediction_pipeline_no_double_glyph() {
         "real mosh-server should advance echo_ack after typed keys (got {})",
         client.echo_ack()
     );
-    assert!(
-        client
-            .graceful_shutdown(Duration::from_secs(10))
-            .expect("graceful shutdown"),
-        "stock server did not acknowledge prediction session shutdown"
-    );
+    assert_graceful_shutdown(&mut client, &server_guard, "prediction session");
 }
 
 #[test]
@@ -446,14 +614,21 @@ fn live_client_survives_resize_and_more_keys() {
         return;
     }
 
-    let (port, key, _server_guard) =
+    let (port, key, server_guard) =
         start_remote_mosh_server(&host, &user, password.as_deref(), ssh_key.as_deref());
-    let mut client = Client::dial(&host, port, &key).expect("dial");
-    client.resize(100, 30);
+    let mut client = Client::dial_with_size(&host, port, &key, 100, 30).expect("dial");
     let _ = poll_until(&mut client, Instant::now() + Duration::from_secs(2), |_| {
         false
     });
-    client.send_keys(b"echo live-ok\n");
+    let initial_screen = framebuffer_text(&client);
+    assert!(
+        initial_screen
+            .lines()
+            .any(|line| line == "MCINITIAL_SIZE:30 100"),
+        "remote child did not start at the requested size; screen={initial_screen:?}"
+    );
+
+    client.send_keys(b"printf 'MCTAB_A\\tMCTAB_B\\n'; echo live-ok\n");
     let paint = poll_until(
         &mut client,
         Instant::now() + Duration::from_secs(5),
@@ -471,13 +646,13 @@ fn live_client_survives_resize_and_more_keys() {
         plain.contains("live-ok"),
         "command output missing; plain={plain:?}"
     );
-    assert!(!client.is_dead(), "client died: {:?}", client.dead_reason());
+    let final_screen = framebuffer_text(&client);
     assert!(
-        client
-            .graceful_shutdown(Duration::from_secs(10))
-            .expect("graceful shutdown"),
-        "stock server did not acknowledge resize session shutdown"
+        final_screen.lines().any(|line| line == "MCTAB_A MCTAB_B"),
+        "official server tab output was not reconstructed exactly; screen={final_screen:?}"
     );
+    assert!(!client.is_dead(), "client died: {:?}", client.dead_reason());
+    assert_graceful_shutdown(&mut client, &server_guard, "resize session");
 }
 
 #[test]
@@ -495,63 +670,66 @@ fn live_large_screen_update_reassembles_against_stock_server() {
         return;
     }
 
-    let (port, key, _server_guard) =
+    let (port, key, server_guard) =
         start_remote_mosh_server(&host, &user, password.as_deref(), ssh_key.as_deref());
     let proxy = UdpBlackholeProxy::start(&host, port);
-    let mut client = Client::dial_with_size("127.0.0.1", proxy.port, &key, 180, 70).expect("dial");
-    client.resize(180, 70);
+    let mut client = Client::dial_with_size("127.0.0.1", proxy.port, &key, 1000, 70).expect("dial");
+    client.resize(1000, 70);
     let _ = poll_until(&mut client, Instant::now() + Duration::from_secs(2), |_| {
         false
     });
     proxy.clear_server_packets();
 
-    let command = b"python3 -c 'import hashlib;[(print(\"MCLARGE%03d:\"%i+\"\".join(hashlib.sha256((\"%d:%d\"%(i,j)).encode()).hexdigest() for j in range(3))[:140])) for i in range(50)];print(\"MCLARGE_DONE\")'\n";
+    // Keep the server isolated while it builds a 100,000-cell state with
+    // unique combining marks. This makes stock mosh-server send one compressed
+    // instruction above 1 MiB after the route recovers, including on 1.3.x.
+    let command = b"sleep 1; python3 -c 'import hashlib,sys;s=\"\".join(\"X\"+\"\".join(chr(0x300+b%112) for b in hashlib.shake_256(str(i).encode()).digest(15)) for i in range(68000));sys.stdout.buffer.write(s.encode()+b\"\\033[70;1HMCLARGE_DONE\")'\n";
     client.send_keys(command);
+    client.poll().expect("send large-state command");
+    thread::sleep(Duration::from_millis(100));
+    proxy.set_blackholed(true);
+    thread::sleep(Duration::from_secs(4));
+    proxy.set_blackholed(false);
 
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(45);
     let mut final_screen = String::new();
     while Instant::now() < deadline {
         client.poll().expect("poll");
         final_screen = framebuffer_text(&client);
-        if final_screen.lines().any(|line| line == "MCLARGE_DONE") {
+        if final_screen
+            .lines()
+            .any(|line| line.contains("MCLARGE_DONE"))
+        {
             break;
         }
         thread::sleep(Duration::from_millis(15));
     }
 
     assert!(
-        final_screen.lines().any(|line| line == "MCLARGE_DONE"),
+        final_screen
+            .lines()
+            .any(|line| line.contains("MCLARGE_DONE")),
         "large output never reached its sentinel; screen={final_screen:?}"
     );
-    let complete_bodies = final_screen
+    let filled_rows = final_screen
         .lines()
-        .filter_map(|line| {
-            let Some((prefix, body)) = line.split_once(':') else {
-                return None;
-            };
-            (prefix.starts_with("MCLARGE")
-                && prefix.len() == "MCLARGE000".len()
-                && body.len() == 140
-                && body.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            .then_some(body)
-        })
-        .collect::<HashSet<_>>();
+        .filter(|line| line.len() == 1000 && line.bytes().all(|byte| byte == b'X'))
+        .count();
     assert!(
-        complete_bodies.len() >= 40,
-        "expected at least 40 distinct intact large rows, got {}; screen={final_screen:?}",
-        complete_bodies.len()
+        filled_rows >= 45,
+        "large fragmented terminal state was truncated; rows={filled_rows}, wire_bytes={}",
+        proxy.largest_server_instruction_payload(&key)
     );
     assert!(
         proxy.has_fragmented_server_instruction(&key),
         "stock server never emitted a multi-fragment instruction for the large update"
     );
-    assert!(!client.is_dead(), "client died: {:?}", client.dead_reason());
     assert!(
-        client
-            .graceful_shutdown(Duration::from_secs(10))
-            .expect("graceful shutdown"),
-        "stock server did not acknowledge large-output session shutdown"
+        proxy.largest_server_instruction_payload(&key) > 1024 * 1024,
+        "stock server response did not cross the former 1 MiB receive limit"
     );
+    assert!(!client.is_dead(), "client died: {:?}", client.dead_reason());
+    assert_graceful_shutdown(&mut client, &server_guard, "large-output session");
 }
 
 #[test]
@@ -569,7 +747,7 @@ fn live_session_recovers_after_silent_udp_blackhole() {
         return;
     }
 
-    let (server_port, key, _server_guard) =
+    let (server_port, key, server_guard) =
         start_remote_mosh_server(&host, &user, password.as_deref(), ssh_key.as_deref());
     let proxy = UdpBlackholeProxy::start(&host, server_port);
     let mut client = Client::dial_with_size("127.0.0.1", proxy.port, &key, 100, 30).expect("dial");
@@ -641,10 +819,5 @@ fn live_session_recovers_after_silent_udp_blackhole() {
         ConnectionStatus::Online,
         "network notification did not clear after recovery"
     );
-    assert!(
-        client
-            .graceful_shutdown(Duration::from_secs(10))
-            .expect("graceful shutdown"),
-        "stock server did not acknowledge recovered session shutdown"
-    );
+    assert_graceful_shutdown(&mut client, &server_guard, "recovered session");
 }

@@ -289,6 +289,14 @@ impl Predictor {
             v.extend_from_slice(input);
             v
         };
+        // Do not predict any part of a read that contains destructive editing.
+        // The complete byte slice is still forwarded to the server by the
+        // caller, but suppressing the whole local batch avoids repainting later
+        // bytes from a cursor position that the backspace made uncertain.
+        if data.iter().any(|byte| matches!(byte, 0x08 | 0x7f)) {
+            self.reset();
+            return;
+        }
         let mut i = 0;
         while i < data.len() {
             if self.preference == DisplayPreference::Experimental {
@@ -337,16 +345,6 @@ impl Predictor {
     fn handle_decoded_char(&mut self, ch: char, fb: &Framebuffer) {
         if ch == '\u{FFFD}' {
             self.become_tentative();
-            return;
-        }
-        // Do not speculate about destructive editing. Stock mosh predicts DEL
-        // by shifting the host row, but it cannot know the shell's editable
-        // boundary and rapid repeats can visibly erase prompt cells until the
-        // authoritative host frame catches up (Netcatty #2275). Treat both
-        // common erase bytes like mosh-go: drop local predictions and wait for
-        // the server to render the actual result.
-        if ch == '\u{7f}' || ch == '\u{08}' {
-            self.reset();
             return;
         }
         if (ch as u32) < 0x20 {

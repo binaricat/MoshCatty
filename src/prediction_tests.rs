@@ -327,6 +327,23 @@ fn both_backspace_bytes_cancel_pending_local_echo() {
 }
 
 #[test]
+fn backspace_cancels_prediction_for_the_entire_input_batch() {
+    for erase in [0x08, 0x7f] {
+        let mut pipe = DisplayPipeline::new(40, 10, DisplayPreference::Always);
+        pipe.prove_band_for_test();
+        let mut input = b"abc".to_vec();
+        input.push(erase);
+        input.extend_from_slice(b"xyz");
+
+        let paint = pipe.on_keystroke(&input);
+
+        assert!(paint.is_empty());
+        assert_eq!(pipe.predictor().pending_len(), 0);
+        assert!(!pipe.predictor().active());
+    }
+}
+
+#[test]
 fn kill_epoch_drains_matched_prefix() {
     let mut p = always();
     p.set_cursor(0, 0);

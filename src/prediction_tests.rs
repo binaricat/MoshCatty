@@ -344,6 +344,25 @@ fn backspace_cancels_prediction_for_the_entire_input_batch() {
 }
 
 #[test]
+fn backspace_waits_for_a_host_frame_before_local_echo_resumes() {
+    let mut pipe = DisplayPipeline::new(40, 10, DisplayPreference::Always);
+    pipe.prove_band_for_test();
+    let _ = pipe.on_host_bytes(b"abc");
+
+    let _ = pipe.on_keystroke(&[0x7f]);
+    let paint_before_host = pipe.on_keystroke(b"x");
+
+    assert!(paint_before_host.is_empty());
+    assert_eq!(pipe.predictor().pending_len(), 0);
+    assert_eq!(pipe.last_shown().unwrap().cell_at(3, 0).unwrap().ch, ' ');
+
+    let _ = pipe.on_host_bytes(b"\x1b[H\x1b[Kab");
+    let _ = pipe.on_keystroke(b"x");
+
+    assert_eq!(pipe.predictor().pending_known_char_at(2, 0), Some('x'));
+}
+
+#[test]
 fn kill_epoch_drains_matched_prefix() {
     let mut p = always();
     p.set_cursor(0, 0);

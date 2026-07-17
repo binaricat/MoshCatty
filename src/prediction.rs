@@ -119,6 +119,9 @@ pub struct Predictor {
     /// hidden cursor does not erase the last confirmed cursor on the glass.
     cursors: Vec<CursorPrediction>,
     last_quick_confirmation: Option<Instant>,
+    /// Backspace makes the local cursor ambiguous until the server paints the
+    /// result. Suppress all speculative echo while this latch is set.
+    awaiting_host_after_erase: bool,
     /// Stock predict_overwrite (env MOSH_PREDICTION_OVERWRITE).
     overwrite: bool,
 }
@@ -150,6 +153,7 @@ impl Predictor {
             local_frame_late_acked: 0,
             cursors: Vec::new(),
             last_quick_confirmation: None,
+            awaiting_host_after_erase: false,
             overwrite: std::env::var("MOSH_PREDICTION_OVERWRITE")
                 .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
                 .unwrap_or(false),
@@ -282,6 +286,9 @@ impl Predictor {
             self.reset();
             return;
         }
+        if self.awaiting_host_after_erase {
+            return;
+        }
         let data: Vec<u8> = if self.esc_buf.is_empty() {
             input.to_vec()
         } else {
@@ -295,6 +302,7 @@ impl Predictor {
         // bytes from a cursor position that the backspace made uncertain.
         if data.iter().any(|byte| matches!(byte, 0x08 | 0x7f)) {
             self.reset();
+            self.awaiting_host_after_erase = true;
             return;
         }
         let mut i = 0;
@@ -696,6 +704,12 @@ impl Predictor {
         // Stock reset does not zero glitch_trigger / last_quick_confirmation.
         self.esc_buf.clear();
         self.cursors.clear();
+    }
+
+    /// Resume speculation only after an authoritative server frame has
+    /// resolved the cursor position made ambiguous by backspace.
+    fn observe_host_frame(&mut self) {
+        self.awaiting_host_after_erase = false;
     }
 
     /// mosh-go `SetCursor` — only tracks server cursor when inactive.
@@ -1418,6 +1432,7 @@ impl DisplayPipeline {
         if geometry || scrolled {
             self.predictor.reset();
         }
+        self.predictor.observe_host_frame();
         self.predictor
             .set_cursor(self.host_fb.cur_x, self.host_fb.cur_y);
         self.predictor.confirm(&self.host_fb);
@@ -1450,6 +1465,7 @@ impl DisplayPipeline {
         if geometry {
             self.predictor.reset();
         }
+        self.predictor.observe_host_frame();
         self.predictor
             .set_cursor(self.host_fb.cur_x, self.host_fb.cur_y);
         self.predictor.confirm(&self.host_fb);

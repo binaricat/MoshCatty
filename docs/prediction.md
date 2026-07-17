@@ -1,7 +1,8 @@
 # Local prediction (speculative echo)
 
 Status: **best-within-constraints** — stock overlay/keystroke/confirm semantics on a pure-Rust Diff paint path  
-Related: [Netcatty #2121](https://github.com/binaricat/Netcatty/issues/2121)
+Related: [Netcatty #2121](https://github.com/binaricat/Netcatty/issues/2121),
+[Netcatty #2275](https://github.com/binaricat/Netcatty/issues/2275)
 
 ## Architecture (must not change)
 
@@ -25,7 +26,8 @@ Never require terminfo / Cygwin / system mosh. Pure Rust standalone binary only.
 | Paint path | Single Overlay→Diff; no dual-write |
 | Epoch | start 1/0; hide until credited Correct; reset does not re-align conf |
 | Confirm | late_ack Pending; blank pred always CorrectNoCredit; glitch repair only on Correct |
-| Insert/BS | full-row maps; BS dual-unknown tail (`i+2`); overwrite space |
+| Insert | full-row maps; overwrite mode replaces one cell |
+| Backspace (`0x08` / `0x7f`) | cancel local predictions and wait for host truth; never speculate across prompt boundaries |
 | Last-col print | known glyph + double become_tentative + wrap |
 | Bottom CR | blank-predict full last row |
 | CSI C/D | ±1 (params ignored) |

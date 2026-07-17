@@ -10,7 +10,7 @@
 //! - Underline **flagging** hysteresis (80/50 ms), separate from show
 //! - Overlay: blank-on-blank no under; unknown underline-only (skip last col);
 //!   known cells apply only when differing from host, then flag under
-//! - Insert/BS shift the **full remaining row** (stock); overwrite BS → space
+//! - Insert shifts the **full remaining row** (stock)
 //! - Glitch: any non-zero `glitch_trigger` forces show; `> REPAIR_COUNT` flags
 //! - Frame-ack Pending via late_ack (`echo_ack_num`) vs expiration_sent
 //!
@@ -93,7 +93,7 @@ struct CursorPrediction {
     expiration_sent: u64,
 }
 
-/// mosh-go pending list + stock tentative / frame-ack / flagging / BS / arrows.
+/// mosh-go pending list + stock tentative / frame-ack / flagging / arrows.
 #[derive(Debug)]
 pub struct Predictor {
     pending: Vec<Prediction>,
@@ -271,7 +271,7 @@ impl Predictor {
 
     /// mosh-go `Active`.
     pub fn active(&self) -> bool {
-        // Include cursor-only prediction (arrows / BS with empty pending).
+        // Include cursor-only prediction (arrows / CR with empty pending).
         self.active
     }
 
@@ -339,13 +339,14 @@ impl Predictor {
             self.become_tentative();
             return;
         }
-        // Stock: only DEL (0x7f) is predicted BS. BS (0x08) is Execute → tentative.
-        if ch == '\u{7f}' {
-            self.predict_backspace(fb);
-            return;
-        }
-        if ch == '\u{08}' {
-            self.become_tentative();
+        // Do not speculate about destructive editing. Stock mosh predicts DEL
+        // by shifting the host row, but it cannot know the shell's editable
+        // boundary and rapid repeats can visibly erase prompt cells until the
+        // authoritative host frame catches up (Netcatty #2275). Treat both
+        // common erase bytes like mosh-go: drop local predictions and wait for
+        // the server to render the actual result.
+        if ch == '\u{7f}' || ch == '\u{08}' {
+            self.reset();
             return;
         }
         if (ch as u32) < 0x20 {
@@ -649,132 +650,6 @@ impl Predictor {
             self.pending.push(cell);
         }
         self.cur_x = cx.saturating_add(1);
-        self.active = true;
-        self.record_cursor_prediction();
-        self.sort_pending();
-    }
-
-    fn predict_backspace(&mut self, fb: &Framebuffer) {
-        if self.cur_x == 0 {
-            return;
-        }
-        let cx = self.cur_x - 1;
-        let cy = self.cur_y;
-        // Fast path (insert mode only): undo last same-epoch glyph we just placed.
-        // Stock overwrite BS never undoes — it always predicts a space.
-        if !self.overwrite {
-            if let Some(last) = self.pending.last() {
-                if last.epoch == self.prediction_epoch
-                    && last.x == cx
-                    && last.y == cy
-                    && !last.unknown
-                {
-                    let only = !self
-                        .pending
-                        .iter()
-                        .any(|p| p.y == cy && p.x > cx && p.epoch == self.prediction_epoch);
-                    if only {
-                        self.pending.pop();
-                        self.cur_x = cx;
-                        self.active = true;
-                        self.record_cursor_prediction();
-                        return;
-                    }
-                }
-            }
-        }
-        // Overwrite-mode BS: stock clears cell to space (no row shift).
-        if self.overwrite {
-            let orig = fb.cell_at(cx, cy).map(|c| c.ch).unwrap_or(' ');
-            let previous = self
-                .pending
-                .iter()
-                .position(|p| p.y == cy && p.x == cx)
-                .map(|index| self.pending.remove(index));
-            let mut prediction = self.make_pred(' ', cx, cy, orig, false);
-            prediction.original_contents = prediction_history(previous.as_ref(), orig);
-            self.pending.push(prediction);
-            self.cur_x = cx;
-            self.active = true;
-            self.record_cursor_prediction();
-            self.sort_pending();
-            return;
-        }
-
-        // Stock insert-mode BS: for i from cursor to width-1, if i+2 < width copy
-        // from i+1 else mark unknown. That makes the *last two* columns unknown
-        // (penultimate never receives former last glyph) — match stock exactly.
-        let exp = self.local_frame_sent.saturating_add(1);
-        let ep = self.prediction_epoch;
-        let now = Instant::now();
-        let width = fb.cols;
-
-        let mut row: Vec<Option<Prediction>> = vec![None; width];
-        let mut rest = Vec::with_capacity(self.pending.len());
-        for p in self.pending.drain(..) {
-            if p.y == cy && p.x < width {
-                let x = p.x;
-                row[x] = Some(p);
-            } else {
-                rest.push(p);
-            }
-        }
-
-        let mut new_row: Vec<Option<Prediction>> = vec![None; width];
-        for x in cx..width {
-            let orig = fb.cell_at(x, cy).map(|c| c.ch).unwrap_or(' ');
-            if x + 2 < width {
-                let (ch, unknown) = if let Some(next) = row[x + 1].as_ref() {
-                    if next.unknown {
-                        (' ', true)
-                    } else {
-                        (next.ch, false)
-                    }
-                } else {
-                    let src = fb.cell_at(x + 1, cy);
-                    let ch = src
-                        .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
-                        .unwrap_or(' ');
-                    (ch, false)
-                };
-                let original_contents = prediction_history(row[x].as_ref(), orig);
-                new_row[x] = Some(Prediction {
-                    ch,
-                    x,
-                    y: cy,
-                    epoch: ep,
-                    at: now,
-                    expiration_sent: exp,
-                    original_contents,
-                    unknown,
-                    overlay_attr: None,
-                });
-            } else {
-                // Stock: last two columns are unknown after insert-mode BS.
-                let original_contents = prediction_history(row[x].as_ref(), orig);
-                new_row[x] = Some(Prediction {
-                    ch: ' ',
-                    x,
-                    y: cy,
-                    epoch: ep,
-                    at: now,
-                    expiration_sent: exp,
-                    original_contents,
-                    unknown: true,
-                    overlay_attr: None,
-                });
-            }
-        }
-        // Keep columns left of cx unchanged from prior row map.
-        for x in 0..cx {
-            new_row[x] = row[x].take();
-        }
-
-        self.pending = rest;
-        for cell in new_row.into_iter().flatten() {
-            self.pending.push(cell);
-        }
-        self.cur_x = cx;
         self.active = true;
         self.record_cursor_prediction();
         self.sort_pending();

@@ -67,6 +67,8 @@ Peer products either skip Windows Mosh or own a private engine. MoshCatty is the
 - **Drop-in CLI**: `MOSH_KEY=<key> mosh-client <host> <port>`
 - **Speculative local echo** (stock overlay rules on a mosh-go Diff path):
   host_fb → Confirm → Overlay → Diff (`MOSH_PREDICTION_DISPLAY=adaptive|always|never|experimental`).
+  Backspace always waits for the authoritative host frame so rapid repeats
+  cannot speculatively erase shell prompt cells.
   See `docs/prediction.md`.
 - **Recoverable-outage status**: stock-style connecting / last-contact /
   last-reply notification bar, cleared automatically after the path recovers

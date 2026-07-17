@@ -119,9 +119,10 @@ pub struct Predictor {
     /// hidden cursor does not erase the last confirmed cursor on the glass.
     cursors: Vec<CursorPrediction>,
     last_quick_confirmation: Option<Instant>,
-    /// Backspace makes the local cursor ambiguous until the server paints the
-    /// result. Suppress all speculative echo while this latch is set.
-    awaiting_host_after_erase: bool,
+    /// Backspace makes the local cursor ambiguous until the server has echoed
+    /// every input sent while waiting. The watermark is the first unacked
+    /// local frame that must be observed before speculation can resume.
+    erase_wait_until_late_ack: Option<u64>,
     /// Stock predict_overwrite (env MOSH_PREDICTION_OVERWRITE).
     overwrite: bool,
 }
@@ -153,7 +154,7 @@ impl Predictor {
             local_frame_late_acked: 0,
             cursors: Vec::new(),
             last_quick_confirmation: None,
-            awaiting_host_after_erase: false,
+            erase_wait_until_late_ack: None,
             overwrite: std::env::var("MOSH_PREDICTION_OVERWRITE")
                 .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
                 .unwrap_or(false),
@@ -286,7 +287,10 @@ impl Predictor {
             self.reset();
             return;
         }
-        if self.awaiting_host_after_erase {
+        if self.erase_wait_until_late_ack.is_some() {
+            if !input.is_empty() {
+                self.erase_wait_until_late_ack = Some(self.local_frame_sent.saturating_add(1));
+            }
             return;
         }
         let data: Vec<u8> = if self.esc_buf.is_empty() {
@@ -302,7 +306,7 @@ impl Predictor {
         // bytes from a cursor position that the backspace made uncertain.
         if data.iter().any(|byte| matches!(byte, 0x08 | 0x7f)) {
             self.reset();
-            self.awaiting_host_after_erase = true;
+            self.erase_wait_until_late_ack = Some(self.local_frame_sent.saturating_add(1));
             return;
         }
         let mut i = 0;
@@ -706,10 +710,15 @@ impl Predictor {
         self.cursors.clear();
     }
 
-    /// Resume speculation only after an authoritative server frame has
-    /// resolved the cursor position made ambiguous by backspace.
-    fn observe_host_frame(&mut self) {
-        self.awaiting_host_after_erase = false;
+    /// Resume speculation only after the server has processed the erase and
+    /// every subsequent input that was deliberately not predicted.
+    fn observe_late_ack(&mut self) {
+        if self
+            .erase_wait_until_late_ack
+            .is_some_and(|watermark| self.late_ack() >= watermark)
+        {
+            self.erase_wait_until_late_ack = None;
+        }
     }
 
     /// mosh-go `SetCursor` — only tracks server cursor when inactive.
@@ -1295,6 +1304,7 @@ impl DisplayPipeline {
         let before_show = self.predictor.should_show();
         let before_flag = self.predictor.flagging();
         self.predictor.set_frames(sent, early_acked, late_acked);
+        self.predictor.observe_late_ack();
         // Ack-only packets never call on_host_bytes; still Confirm/Pending drain.
         if before_pending > 0 || before_active {
             self.predictor.confirm(&self.host_fb);
@@ -1432,7 +1442,6 @@ impl DisplayPipeline {
         if geometry || scrolled {
             self.predictor.reset();
         }
-        self.predictor.observe_host_frame();
         self.predictor
             .set_cursor(self.host_fb.cur_x, self.host_fb.cur_y);
         self.predictor.confirm(&self.host_fb);
@@ -1465,7 +1474,6 @@ impl DisplayPipeline {
         if geometry {
             self.predictor.reset();
         }
-        self.predictor.observe_host_frame();
         self.predictor
             .set_cursor(self.host_fb.cur_x, self.host_fb.cur_y);
         self.predictor.confirm(&self.host_fb);

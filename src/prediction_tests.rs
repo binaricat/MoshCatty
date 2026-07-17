@@ -348,18 +348,35 @@ fn backspace_waits_for_a_host_frame_before_local_echo_resumes() {
     let mut pipe = DisplayPipeline::new(40, 10, DisplayPreference::Always);
     pipe.prove_band_for_test();
     let _ = pipe.on_host_bytes(b"abc");
+    let _ = pipe.set_frames_late_for_test(10, 10, 10);
 
     let _ = pipe.on_keystroke(&[0x7f]);
+    let _ = pipe.set_frames_late_for_test(11, 10, 10);
+
+    // A newer frame that was already in flight before the erase must not
+    // release the latch.
+    let _ = pipe.on_host_bytes(b"\x1b[H\x1b[Kabc");
     let paint_before_host = pipe.on_keystroke(b"x");
+    let _ = pipe.set_frames_late_for_test(12, 11, 10);
 
     assert!(paint_before_host.is_empty());
     assert_eq!(pipe.predictor().pending_len(), 0);
     assert_eq!(pipe.last_shown().unwrap().cell_at(3, 0).unwrap().ch, ' ');
 
+    // The server has processed the erase, but not the following x that was
+    // also suppressed locally, so prediction must remain paused.
     let _ = pipe.on_host_bytes(b"\x1b[H\x1b[Kab");
-    let _ = pipe.on_keystroke(b"x");
+    let _ = pipe.set_frames_late_for_test(12, 11, 11);
+    assert!(pipe.on_keystroke(b"y").is_empty());
+    let _ = pipe.set_frames_late_for_test(13, 12, 11);
 
-    assert_eq!(pipe.predictor().pending_known_char_at(2, 0), Some('x'));
+    // Once the host has painted and acknowledged every suppressed input,
+    // prediction can safely resume from the authoritative cursor.
+    let _ = pipe.on_host_bytes(b"\x1b[H\x1b[Kabxy");
+    let _ = pipe.set_frames_late_for_test(13, 13, 13);
+    let _ = pipe.on_keystroke(b"z");
+
+    assert_eq!(pipe.predictor().pending_known_char_at(4, 0), Some('z'));
 }
 
 #[test]
